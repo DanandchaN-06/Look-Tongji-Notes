@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>课程助手 · Look Tongji Notes</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<a class="skip-link" href="#mainContent">跳到主要内容</a>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-text">
+        <strong>课程助手</strong>
+        <small>Look Tongji Notes</small>
+      </span>
+    </div>
+    <nav class="nav" aria-label="主要导航">
+      <button class="nav-item is-active" data-view="home">开始使用</button>
+      <button class="nav-item" data-view="settings">账号与保存设置</button>
+      <button class="nav-item" data-view="courses">选课与采集素材</button>
+      <button class="nav-item" data-view="tasks">任务进度</button>
+      <button class="nav-item" data-view="agent">Agent 写作工作台</button>
+      <button class="nav-item" data-view="wiki">资料库与阅读</button>
+    </nav>
+    <div class="side-foot">
+      <div id="statusPill" class="pill pill-muted">正在检查环境…</div>
+      <div id="repoPath" class="mono tiny"></div>
+    </div>
+  </aside>
+
+  <main class="main" id="mainContent" tabindex="-1">
+    <div class="workspace-bar">
+      <span>本地学习工作台 <span class="version">v0.4.4</span><small id="currentContext" class="context-line">先完成设置，再选择课程</small></span>
+      <button class="btn btn-sm" id="btnHelp" type="button">使用说明</button>
+    </div>
+    <div id="banner" class="banner hidden" role="status" aria-live="polite"></div>
+    <!-- ============ 首页与向导 ============ -->
+    <section class="view is-active" data-view="home">
+      <header class="view-head">
+        <div class="eyebrow">LOOK TONGJI NOTES</div>
+        <h1>从课堂录课，到复习知识库</h1>
+        <p class="muted">采集课程素材，交给你选择的 Agent 写作，再校验并构建知识库。</p>
+      </header>
+
+      <div class="workflow" aria-label="课程处理流程">
+        <button data-goto="courses"><span class="step-number">01</span><strong>采集素材</strong><small>字幕、课件与补充材料</small></button>
+        <button data-goto="agent"><span class="step-number">02</span><strong>交给 Agent</strong><small>笔记、时间轴与速查表</small></button>
+        <button data-goto="wiki"><span class="step-number">03</span><strong>校验与构建</strong><small>核对文件，本地预览知识库</small></button>
+      </div>
+      <div class="onboarding-note">
+        <div><h2>第一次使用，从这里开始</h2><p id="nextStepHint">填写账号并选一个保存资料的文件夹。</p></div>
+        <button class="btn btn-primary" id="btnNextStep">开始设置</button>
+      </div>
+      <details class="knowledge-explainer"><summary>“知识库”是什么？</summary><p>就是你电脑上的课程资料文件夹，按课程和课次保存字幕、课件、讲义、笔记及时间轴。写好笔记后，可以生成浏览器阅读网页，方便复习查找。</p><p>本地预览在你的电脑上阅读；发布到 GitHub Pages 会上传网页内容，公开范围由目标仓库和 Pages 设置决定。</p></details>
+
+      <div class="grid grid-4" id="statCards">
+        <div class="card stat"><span class="stat-label">账号凭据</span><span class="stat-value" id="statCred">—</span></div>
+        <div class="card stat"><span class="stat-label">知识库路径</span><span class="stat-value" id="statWs">—</span></div>
+        <div class="card stat"><span class="stat-label">视觉模型</span><span class="stat-value" id="statVision">—</span></div>
+        <div class="card stat"><span class="stat-label">运行依赖</span><span class="stat-value" id="statDeps">—</span></div>
+      </div>
+
+      <div class="card">
+        <h2>首次配置向导</h2>
+        <ol class="steps" id="wizardSteps">
+          <li data-step="cred"><span class="dot"></span><div><strong>填写同济账号</strong><em>在「设置中心」保存，密码只写入本机 .env</em></div><button class="btn btn-sm" data-goto="settings">去设置</button></li>
+          <li data-step="ws"><span class="dot"></span><div><strong>选择知识库路径</strong><em>决定字幕、截图与网站的存放位置</em></div><button class="btn btn-sm" data-goto="settings">去设置</button></li>
+          <li data-step="vision"><span class="dot"></span><div><strong>配置视觉模型</strong><em>笔记需要读取课件截图，需一个能看图的模型</em></div><button class="btn btn-sm" data-goto="settings">去设置</button></li>
+          <li data-step="collect"><span class="dot"></span><div><strong>采集第一节素材</strong><em>下载课件；音频转写由哔哩哔哩云端 ASR 处理</em></div><button class="btn btn-sm" data-goto="courses">去选课</button></li>
+          <li data-step="note"><span class="dot"></span><div><strong>生成笔记并构建知识库</strong><em>由 Agent 完成写作，控制台负责校验</em></div><button class="btn btn-sm" data-goto="agent">去交接</button></li>
+        </ol>
+      </div>
+
+      <div class="card">
+        <h2>环境检查</h2>
+        <div id="depsTable" class="table-wrap"></div>
+        <div class="row gap">
+          <button class="btn" id="btnRecheck">重新检查</button>
+          <span class="muted tiny" id="recheckHint"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 设置中心 ============ -->
+    <section class="view" data-view="settings">
+      <header class="view-head">
+        <h1>设置中心</h1>
+        <p class="muted">凭据与密钥只保存在本机文件，不会进入对话、命令行参数或任务日志。</p>
+      </header>
+
+      <div class="card">
+        <h2>同济账号</h2>
+        <div class="field"><label for="envUser">学号 / 工号</label><input id="envUser" type="text" autocomplete="off" placeholder="例如 2xxxxxxxxx"></div>
+        <div class="field"><label for="envPass">密码</label><input id="envPass" type="password" autocomplete="new-password" placeholder="留空表示不修改"></div>
+        <div class="field"><label for="envRepo">GitHub Pages 仓库（可选）</label><input id="envRepo" type="text" autocomplete="off" placeholder="owner/repo"></div>
+        <p class="hint" id="credHint"></p>
+        <div class="row gap"><button class="btn btn-primary" id="btnSaveCred">保存凭据</button></div>
+      </div>
+
+      <div class="card">
+        <h2>课程资料保存目录（知识库）</h2>
+        <p class="hint">选择电脑上的一个文件夹。课程素材和 Agent 写出的笔记保存在这里，生成的阅读网页在其中的 site 子目录。</p>
+        <div class="field">
+          <label for="wsRoot">保存目录</label>
+          <div class="row gap wrap">
+            <input id="wsRoot" class="grow" type="text" placeholder="例如 D:/Courses 或 ~/Courses">
+            <button class="btn" id="btnPickWs" type="button">浏览…</button>
+          </div>
+          <span class="hint" id="wsPickHint">点「浏览…」会弹出系统文件夹选择框（浏览器无法直接读取本地路径）。</span>
+        </div>
+        <div class="grid grid-2">
+          <div class="field"><label for="wsOwner">显示名称</label><input id="wsOwner" type="text" placeholder="你的名字"></div>
+          <div class="field"><label for="wsSite">站点标题</label><input id="wsSite" type="text" placeholder="某某的课程知识库"></div>
+        </div>
+        <label class="check"><input type="checkbox" id="wsMigrate"> <span>同时把已有内容迁移到新路径</span></label>
+        <p class="hint warn" id="wsWarn">不勾选时只改变保存位置，已有文件不会被移动。</p>
+        <div class="row gap"><button class="btn btn-primary" id="btnSaveWs">保存知识库设置</button></div>
+      </div>
+
+      <div class="card">
+        <h2>视觉模型（读取课件截图）</h2>
+        <div class="grid grid-2">
+          <div class="field"><label for="visProvider">平台</label><select id="visProvider"></select></div>
+          <div class="field"><label for="visModel">模型</label><input id="visModel" type="text" list="visModels" placeholder="选择或直接输入"><datalist id="visModels"></datalist></div>
+        </div>
+        <div class="field"><label for="visBase">Base URL</label><input id="visBase" type="text" placeholder="自动填充，可修改"></div>
+        <div class="field"><label for="visKey">API Key</label><input id="visKey" type="password" autocomplete="new-password" placeholder="留空表示不修改"></div>
+        <div id="visHint"></div>
+        <p class="hint">用于读取课件图片，与 Agent 会话的模型设置独立。密钥保存在本机；留空表示沿用同一平台和地址的已保存密钥。</p>
+        <div class="row gap">
+          <button class="btn btn-primary" id="btnSaveVision">保存视觉模型</button>
+          <button class="btn" id="btnTestVision">测试识图</button>
+          <span class="muted tiny" id="visionTestHint"></span>
+        </div>
+        <pre id="visionTestOut" class="log hidden"></pre>
+      </div>
+
+      <div class="card">
+        <h2>环境依赖</h2>
+        <div id="depsTable2" class="table-wrap"></div>
+      </div>
+    </section>
+
+    <!-- ============ 课程与节次 ============ -->
+    <section class="view" data-view="courses">
+      <header class="view-head">
+        <h1>课程与节次</h1>
+        <p class="muted">首次查询会触发登录，可能耗时数十秒。校外网络可能需要同济 VPN。</p>
+      </header>
+
+      <div class="card">
+        <div class="row gap wrap">
+          <input id="courseQuery" class="grow" type="text" aria-label="课程名或教师" placeholder="按课程名或教师搜索">
+          <label class="check inline"><input type="checkbox" id="courseAll"> <span>查找全部可访问课程</span></label>
+          <label class="check inline"><input type="checkbox" id="courseForceLogin"> <span>重新登录验证</span></label>
+          <button class="btn btn-primary" id="btnLoadCourses">获取课程</button>
+        </div>
+        <div id="courseMsg" class="hint"></div>
+        <details class="entry-details"><summary>有录课链接？直接定位课程与课次</summary><div class="row gap wrap"><input id="lectureUrl" class="grow" type="url" aria-label="同济录课链接" placeholder="粘贴 look.tongji.edu.cn 的回放链接"><button class="btn" id="btnResolveLecture">定位链接</button></div></details>
+      </div>
+
+      <div class="split">
+        <div class="card">
+          <h2>课程</h2>
+          <div id="courseList" class="list"><div class="empty">获取课程后，在这里选择课程。</div></div>
+        </div>
+        <div class="card">
+          <h2>节次</h2>
+          <div id="lectureList" class="list"><div class="empty">先选择左侧课程，再选择节次。</div></div>
+          <div class="row gap wrap" id="lectureActions" hidden>
+            <button class="btn btn-primary" id="btnCollect">采集本节字幕与课件</button>
+            <button class="btn" id="btnTranscriptOnly">仅转写字幕</button>
+            <button class="btn" id="btnSlidesOnly">只下载课件截图</button>
+            <button class="btn" id="btnToAgent">去写笔记</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>本节素材状态</h2>
+        <p id="lectureScope" class="hint">在上方选中课次后，采集和导入都作用于该课次。</p>
+        <div id="artifactPanel" class="artifacts"><div class="empty">请先在上方选择一个节次。</div></div>
+      </div>
+
+      <details class="card"><summary>采集高级选项：下载数量、速度与重试</summary><div class="grid grid-2 advanced-fields">
+        <div class="field"><label for="downloadLimit">课件截图数量（0 表示全部）</label><input id="downloadLimit" type="number" min="0" max="5000" value="0"></div>
+        <div class="field"><label for="downloadConcurrency">下载并发数（慢或限流时调低）</label><input id="downloadConcurrency" type="number" min="1" max="16" value="4"></div>
+        <div class="field"><label for="downloadRetries">单张课件最多尝试次数</label><input id="downloadRetries" type="number" min="1" max="8" value="3"></div>
+        <div class="field"><label for="downloadTimeout">单张课件超时（秒）</label><input id="downloadTimeout" type="number" min="5" max="300" value="30"></div>
+      </div><label class="check"><input id="forceTranscribe" type="checkbox"><span>强制重新转写：忽略已有字幕和音频缓存，重新下载</span></label><p class="hint">默认复用已完成字幕。识别失败会保留音频，重试时继续识别。缓存只存本机，不加入阅读网页。</p></details>
+
+      <div class="card">
+        <h2>导入补充材料</h2>
+        <div class="field">
+          <label for="materialList">每行一个：<code>材料名=完整路径</code>，或只写路径</label>
+          <textarea id="materialList" rows="3" placeholder="教师讲义=C:/path/to/handout.pdf&#10;C:/path/to/exercise.docx"></textarea>
+        </div>
+        <div class="row gap wrap">
+          <button class="btn" id="btnPickMaterials" type="button">选择文件…</button>
+          <button class="btn" id="btnImportMaterials">导入到当前节次</button>
+          <span class="muted tiny">支持 PDF / PPTX / DOCX / XLSX，会转换为 Markdown 供生成笔记时参考。</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 任务中心 ============ -->
+    <section class="view" data-view="tasks">
+      <header class="view-head">
+        <h1>任务进度</h1>
+        <p class="muted">查看当前步骤、已处理数量与耗时。切换页面不会中断任务；批量取消会等待当前课次保存。</p>
+      </header>
+
+      <div class="card">
+        <h2>整门课批量转写</h2>
+        <div class="grid grid-2"><div class="field"><label for="batchCourseChoice">要处理的课程</label><select id="batchCourseChoice"><option value="">先在选课页获取课程</option></select></div><div class="field"><label for="batchRetries">每个失败课次最多尝试次数</label><input id="batchRetries" type="number" min="1" max="10" value="3"></div></div>
+        <div id="batchRecovery" class="hint">选中课程后显示可继续的记录。</div>
+        <label class="check"><input id="batchRetryFailed" type="checkbox"><span>也重新尝试已耗尽重试次数的失败课次；已完成的课次保留</span></label>
+        <div class="row gap wrap">
+          <button class="btn btn-primary" id="btnBatch">开始 / 继续批量转写</button>
+          <button class="btn" data-goto="courses">去选择课程</button>
+          <button class="btn" id="btnRefreshTasks">刷新任务</button>
+        </div>
+        <p class="hint">每门课程独立保存恢复记录。任务列表和日志属于本次启动会话；关闭服务后可凭记录继续批量转写。</p>
+      </div>
+
+      <div class="split">
+        <div class="card">
+          <h2>任务列表</h2>
+          <div id="taskList" class="list"></div>
+        </div>
+        <div class="card">
+          <div class="row between">
+            <h2 id="taskDetailTitle">选择任务查看进度</h2>
+            <button class="btn btn-sm btn-danger" id="btnCancelTask" hidden>取消任务</button>
+          </div>
+          <div id="taskProgress" class="task-progress" hidden aria-live="polite"><div class="row between"><strong id="taskStage"></strong><span id="taskPercent"></span></div><progress id="taskProgressBar" max="100" aria-label="任务进度"></progress><div id="taskTracks"></div><p id="taskElapsed" class="hint"></p><p id="taskProgressHint" class="hint"></p></div>
+          <button class="btn btn-primary" id="btnTaskNext" hidden>继续下一步</button>
+          <details class="task-log-details" open><summary>详细日志</summary>
+          <pre id="taskLog" class="log">选择一个任务查看日志。</pre>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ Agent 工作台 ============ -->
+    <section class="view" data-view="agent">
+      <header class="view-head">
+        <h1>Agent 工作台</h1>
+        <p class="muted">笔记、时间轴与速查表必须由 Agent 撰写。控制台负责准备准确指令并在事后校验产物。</p>
+      </header>
+
+      <div class="card" id="agentTargetCard">
+        <div class="row between">
+          <h2>选择要交给 Agent 的课程</h2>
+          <button class="btn btn-sm" id="btnAgentLoadCourses">获取课程</button>
+        </div>
+        <div class="grid grid-2">
+          <div class="field"><label for="agentCourseChoice">课程 · 教师</label><select id="agentCourseChoice"><option value="">请先获取课程，或从课程页选择</option></select></div>
+          <div class="field"><label for="agentLectureChoice">节次 · 上课日期</label><select id="agentLectureChoice" disabled><option value="">请先选择课程</option></select></div>
+        </div>
+        <div id="agentTargetContext" class="target-context" role="status" aria-live="polite">尚未选择节次。选好课程和课次后，核对这里的任务对象。</div>
+        <details id="agentManual">
+          <summary>高级定位：按课程 ID 与节次 ID 查找</summary>
+        <div class="row gap wrap">
+          <input id="agentCourse" type="text" aria-label="课程 ID" placeholder="课程 ID" class="id-input">
+          <input id="agentSub" type="text" aria-label="节次 ID" placeholder="节次 ID" class="id-input">
+        </div>
+        </details>
+        <div class="row gap wrap target-actions">
+          <button class="btn" id="btnCheckArtifacts">检查当前节次素材</button>
+          <button class="btn" data-goto="courses">去课程页采集素材</button>
+        </div>
+        <div id="agentArtifacts" class="artifacts"></div>
+      </div>
+
+      <div class="card">
+        <h2>生成 Agent 指令</h2>
+        <p id="agentScopeSummary" class="hint">学习笔记：针对当前节次的字幕、课件和补充材料撰写。</p>
+        <div class="field">
+          <label for="agentTool">使用的 Agent</label>
+          <select id="agentTool">
+            <option value="generic">通用 Agent（默认）</option>
+            <option value="codex">Codex</option>
+            <option value="claude-code">Claude Code</option>
+            <option value="cursor">Cursor</option>
+            <option value="gemini-cli">Gemini CLI</option>
+            <option value="opencode">OpenCode</option>
+          </select>
+          <span class="hint">选择工具后生成对应的交接说明。Agent 需要能读取本地文件并写入指定目录。</span>
+        </div>
+        <div class="row gap wrap">
+          <label class="check inline"><input type="radio" name="agentKind" value="note" checked> <span>学习笔记</span></label>
+          <label class="check inline"><input type="radio" name="agentKind" value="cheatsheet"> <span>A4 速查表</span></label>
+          <label class="check inline"><input type="radio" name="agentKind" value="wiki"> <span>重建知识库</span></label>
+          <label class="check inline"><input type="radio" name="agentKind" value="publish"> <span>发布网页交接</span></label>
+        </div>
+        <div class="row gap wrap" id="noteOptions">
+          <label class="check inline"><input type="radio" name="noteStyle" value="standard" checked> <span>标准笔记</span></label>
+          <label class="check inline"><input type="radio" name="noteStyle" value="dialogue"> <span>问答体</span></label>
+          <label class="check inline"><input type="checkbox" id="optTimeline" checked> <span>同时生成时间轴大纲</span></label>
+        </div>
+        <div class="field" id="sheetOptions" hidden>
+          <label for="sheetScope">速查表覆盖范围</label><select id="sheetScope"><option value="lecture">当前课次笔记</option><option value="course">整门课程的所有笔记</option></select>
+          <label for="sheetFormat">速查表格式</label>
+          <select id="sheetFormat"><option value="html">HTML（浏览器打开）</option><option value="tex">LaTeX（需要编译为 PDF）</option></select>
+          <label for="sheetOutput">输出位置（可选，位于资料保存目录内）</label><input id="sheetOutput" type="text" placeholder="留空使用默认路径，例如 cheatsheets/review.html">
+          <button class="btn" id="btnSheetEnvironment">检查速查表运行环境</button>
+        </div>
+        <div class="row gap"><button class="btn btn-primary" id="btnMakeInstruction">生成指令</button></div>
+      </div>
+
+      <div class="card">
+        <div class="row between">
+          <h2 id="agentCopyTitle">复制到 Agent</h2>
+          <div class="row gap"><button class="btn btn-sm" id="btnDownloadInstruction" disabled>保存指令</button><button class="btn btn-sm" id="btnCopy" disabled>复制指令</button></div>
+        </div>
+        <div id="agentWarnings"></div>
+        <textarea id="agentInstruction" class="instr" rows="18" readonly placeholder="点击「生成指令」后，这里会出现可直接粘贴给 Agent 的完整任务说明。"></textarea>
+        <h3 id="agentHowtoTitle">在 Agent 中的操作步骤</h3>
+        <ol class="howto">
+          <li>在所选 Agent 中打开本项目目录（<span class="mono tiny" id="howtoRepo"></span>）。</li>
+          <li>把上面的指令完整粘贴到输入框并发送。</li>
+          <li>等待 Agent 完成当前任务并将文件写入指定路径。</li>
+          <li>回到本页点击「校验产物」，检查当前任务要求的文件。文件检测不等于内容质量审核。</li>
+        </ol>
+        <div class="row gap wrap">
+          <button class="btn btn-primary" id="btnVerify">校验产物</button>
+          <button class="btn" data-goto="wiki">完成后生成阅读网页</button>
+          <span class="muted tiny" id="verifyResult" role="status"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 知识库与发布 ============ -->
+    <section class="view" data-view="wiki">
+      <header class="view-head">
+        <h1>我的课程资料库与阅读</h1>
+        <p class="muted">把已经保存的课程内容整理成可阅读的网页。先在本机看，确认后再决定是否公开发布。</p>
+      </header>
+
+      <div class="card">
+        <h2>资料库就是你电脑上的课程文件夹</h2>
+        <p>每门课程下面按课次保存字幕、课件、补充讲义、学习笔记和时间轴。Agent 写出的文件仍在这个目录中，方便以后继续更新。</p>
+        <p class="hint">资料保存位置：<span id="wikiLocation" class="mono">尚未设置</span></p>
+        <div class="library-flow"><span>采集字幕 / 课件</span><span>Agent 写笔记</span><span>同步内容并生成网页</span><span>浏览器阅读</span></div>
+        <div id="wikiState" class="artifacts"></div>
+        <div class="row gap wrap">
+          <button class="btn" id="btnIndex">同步最新课程内容</button>
+          <button class="btn btn-primary" id="btnBuildSite">生成 / 更新阅读网页</button>
+          <button class="btn" id="btnServe">在本机打开阅读网页</button>
+          <button class="btn btn-danger" id="btnServeStop" hidden>停止预览</button>
+          <button class="btn" id="btnOpenWorkspace">打开知识库目录</button>
+        </div>
+        <p class="hint" id="serveHint"></p>
+        <p class="hint">“同步内容”把最新素材和笔记登记到阅读内容中；“生成网页”会同时同步并生成 site/；本机阅读只在当前电脑访问。</p>
+      </div>
+
+      <div class="card">
+        <h2>发布到 GitHub Pages</h2>
+        <div id="publishState" class="artifacts"></div>
+        <p>发布会把生成的网页上传到目标 GitHub 仓库，并通过 Pages 提供访问地址。发布范围由仓库和 Pages 设置决定，先核对要公开的材料。</p>
+        <p class="hint warn">课程材料可能包含版权内容。发布前请确认你有权公开，并确保 <code>.env</code>、<code>state/</code> 未被纳入站点。</p>
+        <div class="row gap wrap">
+          <button class="btn" id="btnPublishCheck">发布前检查</button>
+          <button class="btn btn-primary" id="btnPublishInstruction">生成 Agent 发布指令</button>
+        </div>
+        <div id="publishReport" class="publish-report" role="status"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<dialog id="helpDialog" aria-labelledby="helpTitle">
+  <div class="row between"><h2 id="helpTitle">如何使用课程助手</h2><button class="btn btn-sm" id="btnCloseHelp">关闭</button></div>
+  <ol class="howto">
+    <li>在设置中心保存同济账号、知识库路径；需要读图时配置视觉模型。</li>
+    <li>获取课程，选择节次，采集字幕和课件，必要时导入补充材料。</li>
+    <li>在 Agent 工作台选择工具与任务，将指令交给 Agent 执行。</li>
+    <li>校验生成的文件，构建站点并打开本地预览。</li>
+  </ol>
+  <p class="hint">转写会将课程音频上传至哔哩哔哩云端 ASR。发布网站前，请确认材料可以公开。关闭浏览器后，后台服务仍运行；在启动终端按 Ctrl+C 停止。</p>
+  <h3>原项目功能与对应入口</h3><div id="featureCoverage">正在加载功能说明…</div>
+</dialog>
+<script src="/task-progress.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

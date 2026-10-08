@@ -1,3 +1,25 @@
+# Look Tongji Notes · 本地图形管理器
+
+这是 [原项目](https://github.com/WALKERKILLER/Look-Tongji-Notes) 的 Fork，新增本地图形管理控制台，保留原有阅读网页、CLI 和 Agent 工作流。
+
+**普通 Windows 用户：[下载便携版](https://github.com/DanandchaN-06/Look-Tongji-Notes/releases/latest)**。完整解压后双击 `启动课程助手.cmd`，选 **1 管理控制台**，填写自己的账号和资料目录。首次字幕转写通过入口 **3** 安装 FFmpeg。无需先安装 Python 或运行 pip。
+
+**[管理器详细使用指南](docs/MANAGER_GUIDE.md)** · **[本版发布说明](docs/MANAGER_RELEASE.md)** · **[源码运行说明](console/README.md)**
+
+管理器可以选择课程/课次、采集字幕与课件、导入材料、显示后台进度/日志、取消与恢复批量任务、生成通用 Agent 的笔记/时间轴/速查表指令，并构建和打开原阅读网页。
+
+使用流程：**设置账号与保存目录 → 选择课程和课次 → 采集素材 → 查看任务进度 → 复制指令让 Agent 写笔记 → 更新并打开阅读网页**。
+
+笔记需要你自己的 Agent；视觉接口、LaTeX 编译与 GitHub Pages 发布按需配置。“下载完成”只表示材料已获取，不代表笔记完成。
+
+发行包不含个人账号、课程资料或固定机器路径，首次使用由下载者配置。便携版支持 Windows 10/11 x64，目前为测试版；其他平台继续参考源码安装与原 CLI。原项目署名及 MIT 许可保留。
+
+GitHub 的 **Code → Download ZIP 是源码**，不是内置运行环境的便携版。普通用户请使用上面的 Releases 下载入口。
+
+---
+
+## 原项目说明
+
 <p align="center">
   <strong>English</strong> | <a href="README_ZH.md"><strong>中文</strong></a>
 </p>

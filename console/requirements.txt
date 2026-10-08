@@ -1,0 +1,3 @@
+# Reproducible browser revision for the console and the upstream login CLI.
+-r ../requirements.txt
+playwright==1.60.0

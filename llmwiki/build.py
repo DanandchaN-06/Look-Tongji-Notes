@@ -2762,6 +2762,7 @@ def build_site(
     claude_path: str = "",
     search_mode: str = "auto",
     seed_project_stubs: bool = False,
+    allow_empty: bool = False,
 ) -> int:
     if not RAW_SESSIONS.exists():
         print(
@@ -2772,7 +2773,7 @@ def build_site(
 
     print(f"==> scanning {RAW_SESSIONS}")
     sources = discover_sources(RAW_SESSIONS)
-    if not sources:
+    if not sources and not allow_empty:
         print("  no sources found.", file=sys.stderr)
         return 2
     print(f"  found {len(sources)} source markdowns")

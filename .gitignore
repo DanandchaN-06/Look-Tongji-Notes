@@ -10,3 +10,10 @@ __pycache__/
 .mock-wiki/
 vision-support/config.json
 vision-support/.env
+
+# Portable builds and personal launcher state
+release/
+dist/
+app/data/
+app/runtime/
+app/browsers/

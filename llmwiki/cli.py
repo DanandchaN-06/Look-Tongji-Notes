@@ -222,6 +222,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         claude_path=args.claude,
         search_mode=args.search_mode,
         seed_project_stubs=getattr(args, "seed_project_stubs", False),
+        allow_empty=getattr(args, "allow_empty", False),
     )
 
 
@@ -731,6 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
     build = sub.add_parser("build", help="Compile static HTML site from raw/ + wiki/")
     build.add_argument("--out", type=Path, default=REPO_ROOT / "site", help="Output dir (default: site/)")
     build.add_argument("--synthesize", action="store_true", help="Call claude CLI for overview synthesis")
+    build.add_argument("--allow-empty", action="store_true", help="Render the reading site even before any sources are collected")
     build.add_argument(
         "--claude", type=str, default="",
         help="Path to claude CLI (#421: defaults to `shutil.which('claude')` "

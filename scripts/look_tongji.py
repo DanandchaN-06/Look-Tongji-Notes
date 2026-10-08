@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from tongji_backend.progress import emit as emit_progress
+from tongji_backend.checkpoints import path_for as checkpoint_path
 
 from tongji_backend.workspace import (
     MaterialInput,
@@ -30,6 +33,7 @@ from tongji_backend.workspace import (
     build_workspace_wiki,
     ensure_workspace_config,
     import_materials,
+    load_workspace_config,
     prepare_lecture_workspace,
     sanitize_path_component,
     serve_workspace_wiki,
@@ -309,7 +313,10 @@ def _ensure_authenticated_client(force_login: bool = False) -> tuple[TongjiClien
 
 def _check_deps() -> list[str]:
     missing: list[str] = []
-    if shutil.which("ffmpeg") is None:
+    from tongji_backend.media_tools import resolve_ffmpeg, MediaToolError
+    try:
+        resolve_ffmpeg()
+    except MediaToolError:
         missing.append("ffmpeg")
     for module in ("requests", "dotenv", "playwright.sync_api"):
         try:
@@ -489,10 +496,30 @@ def cmd_list(args: argparse.Namespace) -> int:
     header = "All courses" if args.all_courses else "Recent courses"
     if query:
         header += f" (query: {args.query})"
-    print(f"[List] {header}:")
 
     limit = int(args.limit)
     shown = courses if limit <= 0 else courses[:limit]
+
+    if getattr(args, "json_output", False):
+        payload = {
+            "ok": True,
+            "username": username or "",
+            "source": "all" if args.all_courses else "recent",
+            "query": args.query or "",
+            "courses": [
+                {
+                    "index": idx,
+                    "course_id": str(c.get("course_id") or "").strip(),
+                    "title": _course_title(c),
+                    "teacher": _course_teacher(c),
+                }
+                for idx, c in enumerate(shown, 1)
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    print(f"[List] {header}:")
     for idx, c in enumerate(shown, 1):
         title = _course_title(c)
         teacher = _course_teacher(c)
@@ -502,12 +529,19 @@ def cmd_list(args: argparse.Namespace) -> int:
             label += f" / {teacher}"
         print(f"  {idx}. {label}")
 
+    if getattr(args, "no_prompt", False):
+        return 0
+
     choose = args.choose
     if choose is None:
         raw = input("\nChoose a course number (or press Enter to skip): ").strip()
         if not raw:
             return 0
-        choose = int(raw)
+        try:
+            choose = int(raw)
+        except ValueError:
+            _print_err(f"Invalid selection: {raw}")
+            return 2
 
     if choose < 1 or choose > len(shown):
         _print_err(f"Invalid selection: {choose}")
@@ -516,6 +550,166 @@ def cmd_list(args: argparse.Namespace) -> int:
     selected = shown[choose - 1]
     _save_last_course(selected)
     print(f"[List] Selected: {_course_title(selected)} ({selected.get('course_id', '')})")
+    return 0
+
+
+def cmd_lectures(args: argparse.Namespace) -> int:
+    """List the lectures (sections) of one course. JSON-first, never prompts."""
+    try:
+        client, _username = _ensure_authenticated_client(force_login=args.force_login)
+    except Exception as e:
+        _print_err(str(e))
+        return 1
+
+    course_id = (args.course_id or "").strip()
+    if not course_id and args.lecture_url:
+        cid, _sub = _extract_ids_from_url(args.lecture_url)
+        course_id = (cid or "").strip()
+    if not course_id:
+        _print_err("Missing --course-id (or a lecture URL that contains course_id)")
+        return 2
+
+    try:
+        detail = client.get_course_detail(course_id)
+    except Exception as e:
+        _print_err(f"Failed to get course detail: {e}")
+        return 1
+
+    items: list[dict[str, Any]] = []
+    for lec in detail.get("lectures") or []:
+        if not isinstance(lec, dict):
+            continue
+        items.append({
+            "sub_id": str(lec.get("sub_id") or "").strip(),
+            "sub_title": str(lec.get("sub_title") or "").strip(),
+            "lecturer_name": str(lec.get("lecturer_name") or "").strip(),
+            "date": str(lec.get("date") or "").strip(),
+            "has_playback": lec.get("has_playback") is True,
+        })
+    items.sort(key=lambda x: (x["date"], x["sub_id"]), reverse=True)
+
+    if getattr(args, "json_output", False):
+        print(json.dumps({
+            "ok": True,
+            "course_id": course_id,
+            "title": str(detail.get("title") or "").strip(),
+            "teacher": str(detail.get("teacher") or "").strip(),
+            "lecture_count": len(items),
+            "lectures": items,
+        }, ensure_ascii=False))
+        return 0
+
+    print(f"[Lectures] {str(detail.get('title') or '').strip()} ({course_id})")
+    for idx, it in enumerate(items, 1):
+        suffix = "" if it["has_playback"] else "  [no playback]"
+        print(f"  {idx}. {it['date']}  {it['sub_title']} ({it['sub_id']}){suffix}")
+    return 0
+
+
+def _cheatsheet_template_dir() -> Path | None:
+    root = _skill_root()
+    candidates = [
+        root / "CheatingSheetTemplate",
+        root / ".mock-wiki" / "CheatingSheetTemplate",
+    ]
+    return next((c for c in candidates if (c / "CheatingSheet.tex").exists()), None)
+
+
+def _detect_vision_config(root: Path) -> Path | None:
+    candidates = [
+        root / "vision-support" / "config.json",
+        Path.home() / ".claude" / "skills" / "vision-support" / "config.json",
+        Path.home() / ".agents" / "skills" / "vision-support" / "config.json",
+    ]
+    return next((p for p in candidates if p.exists()), None)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Report environment + configuration state. Never prints secrets."""
+    root = _skill_root()
+    env_file = _env_path()
+
+    env_values: dict[str, str] = {}
+    if env_file.exists():
+        try:
+            env_values = _parse_env_lines(env_file.read_text(encoding="utf-8"))
+        except Exception:
+            env_values = {}
+
+    workspace = load_workspace_config()
+    vision_cfg = _detect_vision_config(root)
+    template_dir = _cheatsheet_template_dir()
+
+    tools: dict[str, str] = {}
+    for name in ("ffmpeg", "node", "npm", "xelatex", "gh", "git"):
+        tools[name] = shutil.which(name) or ""
+    from tongji_backend.media_tools import resolve_ffmpeg, MediaToolError
+    ffmpeg_error = ""
+    try:
+        tools['ffmpeg'] = resolve_ffmpeg()
+    except MediaToolError as exc:
+        tools['ffmpeg'] = ""
+        ffmpeg_error = str(exc)
+
+    workspace_info: dict[str, Any] | None = None
+    if workspace is not None:
+        ws_root = workspace.workspace_root
+        manifests: list[str] = []
+        if ws_root.exists():
+            try:
+                manifests = [str(p) for p in sorted(ws_root.glob("raw/*/*/原始数据/manifest.json"))]
+            except Exception:
+                manifests = []
+        workspace_info = {
+            "workspace_root": str(ws_root),
+            "owner_name": workspace.owner_name,
+            "site_name": workspace.site_name,
+            "exists": ws_root.exists(),
+            "site_built": (ws_root / "site" / "index.html").exists(),
+            "lecture_count": len(manifests),
+            "manifests": manifests[:500],
+            "config_path": str(workspace.config_path),
+        }
+
+    missing = _check_deps()
+    payload = {
+        "ok": True,
+        "repo_root": str(root),
+        "env_path": str(env_file),
+        "env_exists": env_file.exists(),
+        "credentials": {
+            "configured": bool(env_values.get("TONGJI_USERNAME") and env_values.get("TONGJI_PASSWORD")),
+            "username_set": bool(env_values.get("TONGJI_USERNAME")),
+            "password_set": bool(env_values.get("TONGJI_PASSWORD")),
+        },
+        "workspace": workspace_info,
+        "last_course_id": _load_last_course_id() or "",
+        "vision_support": {
+            "configured": vision_cfg is not None,
+            "config_path": str(vision_cfg) if vision_cfg else "",
+        },
+        "tools": tools,
+        "ffmpeg_error": ffmpeg_error,
+        "missing_deps": missing,
+        "deps_ok": not missing,
+        "cheatsheet_template": str(template_dir) if template_dir else "",
+    }
+
+    if getattr(args, "json_output", False):
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    print(f"[Status] repo root      : {payload['repo_root']}")
+    print(f"[Status] .env           : {payload['env_path']} (exists={payload['env_exists']})")
+    print(f"[Status] credentials    : {'configured' if payload['credentials']['configured'] else 'NOT configured'}")
+    print(f"[Status] workspace      : {(workspace_info or {}).get('workspace_root', 'NOT configured')}")
+    if workspace_info:
+        print(f"[Status] site built     : {workspace_info['site_built']}")
+        print(f"[Status] lectures       : {workspace_info['lecture_count']}")
+    print(f"[Status] vision-support : {'configured' if vision_cfg else 'NOT configured'}")
+    print(f"[Status] missing deps   : {missing if missing else 'none'}")
+    for name, path in tools.items():
+        print(f"[Status] tool {name:<8}: {path or 'NOT found'}")
     return 0
 
 
@@ -667,6 +861,7 @@ def _write_lecture_manifest_from_outputs(
     slide_output_dir: Path,
     imported_materials: list[dict[str, Any]] | None = None,
     note_style: str = "standard",
+    slides_regenerated: bool = False,
 ) -> None:
     base = f"{course_id}_{sub_id}"
     current_agent = _detect_current_agent()
@@ -686,34 +881,38 @@ def _write_lecture_manifest_from_outputs(
         except Exception:
             meta = {}
 
-    artifacts = {
+    artifacts = dict(existing_manifest["artifacts"]) if isinstance(existing_manifest.get("artifacts"), dict) else {}
+    artifacts.update({
         "transcript_txt": str(transcript_output_dir / f"{base}.txt"),
         "subtitle_srt": str(transcript_output_dir / f"{base}.srt"),
         "transcript_meta": str(meta_path),
-        "slides_dir": str(slide_output_dir),
-        "slide_index": str(slide_output_dir / "index.json"),
-        "timeline_txt": str(transcript_output_dir / f"{base}_timeline.txt"),
-    }
+    })
+    artifacts.setdefault("slides_dir", str(slide_output_dir))
+    artifacts.setdefault("slide_index", str(slide_output_dir / "index.json"))
+    if slides_regenerated:
+        artifacts.update(slides_dir=str(slide_output_dir), slide_index=str(slide_output_dir / "index.json"))
+    artifacts.setdefault("timeline_txt", str(transcript_output_dir / f"{base}_timeline.txt"))
     merged_agents = _merge_agent_sequence(existing_manifest.get("agents") or existing_manifest.get("agent"), current_agent)
     merged_materials = _merge_material_entries(existing_manifest.get("materials"), imported_materials)
-    manifest = {
+    manifest = {**existing_manifest,
         "course_id": course_id,
         "sub_id": sub_id,
         "course_title": workspace.course_title,
         "session_title": workspace.session_title,
         "agent": current_agent,
         "agents": merged_agents or [current_agent],
-        "lecture_url": lecture_url or "",
-        "video_url": meta.get("video_url", ""),
+        "lecture_url": lecture_url or existing_manifest.get("lecture_url", ""),
+        "video_url": meta.get("video_url", existing_manifest.get("video_url", "")),
         "base_name": base,
         "generated_at": _now_iso(),
-        "duration_seconds": int(meta.get("duration_seconds") or 0),
-        "subtitle_word_count": int(meta.get("word_count") or meta.get("subtitle_word_count") or 0),
-        "note_style": note_style,
+        "duration_seconds": int(meta.get("duration_seconds") or existing_manifest.get("duration_seconds") or 0),
+        "subtitle_word_count": int(meta.get("word_count") or meta.get("subtitle_word_count") or existing_manifest.get("subtitle_word_count") or 0),
+        "note_style": note_style or existing_manifest.get("note_style") or "standard",
         "artifacts": artifacts,
         "materials": merged_materials,
     }
-    dur = int(meta.get("duration_seconds") or 0)
+    dur = manifest["duration_seconds"]
+    manifest.pop("duration_warning", None)
     if 0 < dur < 3600:
         manifest["duration_warning"] = True
     write_manifest(workspace, manifest)
@@ -755,7 +954,72 @@ def _resolve_course_sub(
     return course_id, sub_id
 
 
-def _run_transcript_job(
+def _saved_transcript_ready(out_dir: Path, course_id: str, sub_id: str, username: str) -> bool:
+    base = f"{course_id}_{sub_id}"
+    try:
+        meta = json.loads((out_dir / f"{base}.json").read_text(encoding="utf-8"))
+        if not isinstance(meta, dict) or str(meta.get("course_id")) != course_id or str(meta.get("sub_id")) != sub_id:
+            return False
+        if not username or meta.get("user") != username:
+            return False
+        text = out_dir / f"{base}.txt"
+        if not text.is_file() or text.stat().st_size == 0:
+            return False
+        artifacts = meta.get("artifacts") or {}
+        if not isinstance(artifacts, dict):
+            return False
+        subtitle = out_dir / f"{base}.srt"
+        if artifacts.get("subtitle_srt") and (not subtitle.is_file() or subtitle.stat().st_size == 0):
+            return False
+        hashes = meta.get("artifact_sha256")
+        if meta.get("complete") is True:
+            if not isinstance(hashes, dict) or hashes.get("transcript_txt") != hashlib.sha256(text.read_bytes()).hexdigest():
+                return False
+            return not artifacts.get("subtitle_srt") or hashes.get("subtitle_srt") == hashlib.sha256(subtitle.read_bytes()).hexdigest()
+        # Older upstream results have no commit hashes. Their ASR segments
+        # still let us validate the complete text and timestamps exactly.
+        utterances = meta.get("utterances")
+        if not isinstance(utterances,list) or not utterances or any(not isinstance(u,dict) or not isinstance(u.get("transcript"),str) for u in utterances):
+            return False
+        if text.read_text(encoding="utf-8").strip() != " ".join(u["transcript"] for u in utterances).strip():
+            return False
+        if artifacts.get("subtitle_srt"):
+            from tongji_backend.transcriber import _format_srt_time
+            expected = "\n".join(f"{i}\n{_format_srt_time(u.get('start_time',0))} --> {_format_srt_time(u.get('end_time',0))}\n{u['transcript'].strip()}\n" for i,u in enumerate(utterances,1) if u['transcript'].strip())
+            return subtitle.read_text(encoding="utf-8").strip() == expected.strip()
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _transcript_audio_cache(username: str, course_id: str, sub_id: str) -> Path:
+    identity = json.dumps([username,course_id,sub_id],ensure_ascii=False)
+    cache_dir = _state_dir()/"media"/hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    if not cache_dir.resolve().is_relative_to(_state_dir().resolve()):
+        raise ValueError("音频缓存路径必须位于本机状态目录内")
+    for name in ('audio.mp3','audio.part.mp3','video_raw.tmp','video_raw.tmp.part','job.lock'):
+        if not (cache_dir/name).resolve().is_relative_to(cache_dir.resolve()):
+            raise ValueError("音频缓存包含外部文件链接")
+    return cache_dir/"audio.mp3"
+
+
+def _run_transcript_job(*, client: TongjiClient, username: str, course_id: str, sub_id: str,
+                        lecture_url: str, output_dir: str, tag: str = "Transcript", force_transcribe: bool = False) -> int:
+    from tongji_backend.media_cache import lecture_lock
+    if not re.fullmatch(r"[A-Za-z0-9_-]+",course_id) or not re.fullmatch(r"[A-Za-z0-9_-]+",sub_id):
+        raise ValueError("课程和课次标识格式无效")
+    cache = _transcript_audio_cache(username,course_id,sub_id)
+    output_identity = json.dumps([str(_output_dir(output_dir).resolve()),course_id,sub_id],ensure_ascii=False)
+    results_dir = _state_dir()/"transcript_locks"/hashlib.sha256(output_identity.encode("utf-8")).hexdigest()
+    if not results_dir.resolve().is_relative_to(_state_dir().resolve()):
+        raise ValueError("字幕写入锁必须位于本机状态目录内")
+    # Output identity is independent of account; media stays account-scoped.
+    with lecture_lock(results_dir/"job.lock"), lecture_lock(cache.parent/"job.lock"):
+        return _run_transcript_job_locked(client=client,username=username,course_id=course_id,sub_id=sub_id,
+            lecture_url=lecture_url,output_dir=output_dir,tag=tag,force_transcribe=force_transcribe)
+
+
+def _run_transcript_job_locked(
     *,
     client: TongjiClient,
     username: str,
@@ -764,8 +1028,16 @@ def _run_transcript_job(
     lecture_url: str,
     output_dir: str,
     tag: str = "Transcript",
+    force_transcribe: bool = False,
 ) -> int:
     from tongji_backend.transcriber import NoAudioStreamError, Transcriber, TranscriptionError
+    from tongji_backend.media_tools import MediaToolError
+    emit_progress("transcript", "prepare")
+    out_dir = _output_dir(output_dir)
+    if not force_transcribe and _saved_transcript_ready(out_dir, course_id, sub_id, username):
+        print(f"[{tag}] Reusing existing TXT/SRT; skipping video download and ASR.")
+        emit_progress("transcript", "reuse_transcript")
+        return 0
 
     print(f"[{tag}] Logged in as: {username or '(unknown)'}")
     print(f"[{tag}] course_id={course_id} sub_id={sub_id}")
@@ -778,12 +1050,22 @@ def _run_transcript_job(
     transcriber = Transcriber()
 
     try:
+        cache = _transcript_audio_cache(username,course_id,sub_id)
+        cache_dir = cache.parent
+        if force_transcribe:
+            for path in (cache, cache_dir / "video_raw.tmp"):
+                if not path.resolve().is_relative_to(cache_dir.resolve()):
+                    raise ValueError("音频缓存包含外部文件链接")
+                path.unlink(missing_ok=True)
         transcript, srt_content, utterances = transcriber.transcribe_url(
-            stream_url, http_headers=http_headers
+            stream_url, http_headers=http_headers, audio_cache_path=cache
         )
     except NoAudioStreamError as e:
         _print_err(f"No audio stream: {e}")
         return 1
+    except MediaToolError as e:
+        _print_err(f"音频工具不可用，已停止转写：{e}")
+        return 2
     except TranscriptionError as e:
         _print_err(f"Transcription failed: {e}")
         return 1
@@ -791,7 +1073,6 @@ def _run_transcript_job(
         _print_err(f"Unexpected error: {type(e).__name__}: {e}")
         return 1
 
-    out_dir = _output_dir(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     base = f"{course_id}_{sub_id}"
@@ -805,10 +1086,21 @@ def _run_transcript_job(
         max_end = max(u.get("end_time", 0) for u in utterances)
         duration_seconds = max_end // 1000
 
-    txt_path.write_text(transcript.strip() + "\n", encoding="utf-8")
+    emit_progress("transcript", "write")
+    # The final metadata is the commit marker: interruption cannot leave
+    # mixed old/new subtitle files looking like a completed result.
+    meta_path.unlink(missing_ok=True)
+    txt_staging = txt_path.with_suffix(".txt.part")
+    txt_staging.write_text(transcript.strip() + "\n", encoding="utf-8")
+    os.replace(txt_staging,txt_path)
     if srt_content:
-        srt_path.write_text(srt_content.strip() + "\n", encoding="utf-8")
-    meta_path.write_text(
+        srt_staging = srt_path.with_suffix(".srt.part")
+        srt_staging.write_text(srt_content.strip() + "\n", encoding="utf-8")
+        os.replace(srt_staging,srt_path)
+    else:
+        srt_path.unlink(missing_ok=True)
+    meta_staging = meta_path.with_suffix(".json.part")
+    meta_staging.write_text(
         json.dumps(
             {
                 "course_id": course_id,
@@ -817,6 +1109,9 @@ def _run_transcript_job(
                 "video_url": video_url,
                 "generated_at": _now_iso(),
                 "user": username or "",
+                "complete": True,
+                "artifact_sha256": {"transcript_txt": hashlib.sha256(txt_path.read_bytes()).hexdigest(),
+                                    "subtitle_srt": hashlib.sha256(srt_path.read_bytes()).hexdigest() if srt_content else ""},
                 "duration_seconds": duration_seconds,
                 "artifacts": {
                     "transcript_txt": str(txt_path),
@@ -830,8 +1125,10 @@ def _run_transcript_job(
         + "\n",
         encoding="utf-8",
     )
+    os.replace(meta_staging,meta_path)
 
     print(f"[{tag}] Done. Files written:")
+    emit_progress("transcript", "done")
     print(f"  - {txt_path}")
     if srt_content:
         print(f"  - {srt_path}")
@@ -896,6 +1193,7 @@ def _run_slide_job(
     tag: str = "Slide",
 ) -> int:
     print(f"[{tag}] Logged in as: {username or '(unknown)'}")
+    emit_progress("slides", "prepare")
     print(f"[{tag}] course_id={course_id} sub_id={sub_id}")
     try:
         snapshots = client.get_ppt_snapshots(
@@ -933,6 +1231,7 @@ def _run_slide_job(
 
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    emit_progress("slides", "download", completed=0, total=len(snapshots), unit="张")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
         fut_map = {
@@ -957,6 +1256,7 @@ def _run_slide_job(
                 failures.append({"item": item, "error": err})
             else:
                 results.append(item)
+            emit_progress("slides", "download", completed=done_count, total=total, failed=len(failures), unit="张")
             if done_count % 10 == 0 or done_count == total:
                 print(f"[{tag}] Progress: {done_count}/{total}")
 
@@ -1057,7 +1357,15 @@ def cmd_batch_transcribe(args: argparse.Namespace) -> int:
         _print_err(f"Workspace config failed: {e}")
         return 1
 
-    batch_state_path = config.workspace_root / "batch_state.json"
+    batch_state_path = checkpoint_path(config.workspace_root, course_id)
+    legacy_state_path = config.workspace_root / "batch_state.json"
+    if not batch_state_path.exists() and legacy_state_path.is_file():
+        try:
+            legacy = json.loads(legacy_state_path.read_text(encoding="utf-8"))
+            if isinstance(legacy, dict) and legacy.get("course_id") == course_id:
+                _atomic_write_json(batch_state_path, legacy)
+        except (OSError, ValueError):
+            pass
     max_retries = max(1, int(args.max_retries))
 
     # Load or create batch state (interrupt-safe resume)
@@ -1098,10 +1406,35 @@ def cmd_batch_transcribe(args: argparse.Namespace) -> int:
     def _save_state():
         state["updated_at"] = _now_iso()
         _atomic_write_json(batch_state_path, state)
+        _atomic_write_json(legacy_state_path, state)
+        done = sum(item.get("status") == "done" for item in state["lectures"])
+        failed = sum(item.get("status") == "failed" for item in state["lectures"])
+        emit_progress("batch", "recognize", completed=done + failed, total=len(state["lectures"]), failed=failed, unit="节")
+
+    if getattr(args, "retry_failed", False):
+        for item in state["lectures"]:
+            if item.get("status") == "failed":
+                item.update(status="pending", attempts=0, error=None)
+    _save_state()
+
+    cancel_file = os.environ.get("LOOK_TONGJI_BATCH_CANCEL_FILE", "").strip()
+    cancel_path = Path(cancel_file) if cancel_file else None
 
     try:
         while True:
-            pending = [l for l in state.get("lectures", []) if l["status"] in ("pending", "failed")]
+            if cancel_path is not None and cancel_path.exists():
+                print("\n[Batch] Cancel requested. Saving current state...")
+                for item in state.get("lectures", []):
+                    if item.get("status") == "in_progress":
+                        item["status"] = "pending"
+                _save_state()
+                print(f"[Batch] State saved to {batch_state_path}. Re-run to continue.")
+                return 130
+
+            # NOTE: only 'pending' is taken here. An item is set back to 'pending'
+            # while it still has retries left (see below), so 'failed' means
+            # retries are exhausted and must NOT be re-queued.
+            pending = [l for l in state.get("lectures", []) if l["status"] == "pending"]
             if not pending:
                 break
 
@@ -1118,6 +1451,7 @@ def cmd_batch_transcribe(args: argparse.Namespace) -> int:
             _save_state()
 
             output_dir_str = args.output_dir
+            workspace = None
             if not output_dir_str:
                 try:
                     _config, workspace = _prepare_workspace_for_lecture(
@@ -1125,8 +1459,16 @@ def cmd_batch_transcribe(args: argparse.Namespace) -> int:
                     )
                     output_dir_str = str(workspace.raw_root)
                 except Exception as e:
-                    item["status"] = "failed"
-                    item["error"] = f"Workspace setup failed: {e}"
+                    if item["attempts"] >= max_retries:
+                        item["status"] = "failed"
+                        item["error"] = (
+                            f"Workspace setup failed after {item['attempts']} attempt(s): {e}"
+                        )
+                    else:
+                        item["status"] = "pending"
+                        item["error"] = (
+                            f"Workspace setup attempt {item['attempts']}/{max_retries} failed: {e}"
+                        )
                     _save_state()
                     continue
 
@@ -1138,7 +1480,16 @@ def cmd_batch_transcribe(args: argparse.Namespace) -> int:
                 lecture_url="",
                 output_dir=output_dir_str,
                 tag="Batch",
+                force_transcribe=getattr(args, "force_transcribe", False),
             )
+            if result == 0 and workspace is not None:
+                try:
+                    _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
+                        lecture_url="", transcript_output_dir=Path(output_dir_str), slide_output_dir=workspace.raw_slides_dir,
+                        note_style="")
+                except Exception as exc:
+                    _print_err(f"Failed to register transcript: {exc}")
+                    result = 1
 
             if result == 0:
                 item["status"] = "done"
@@ -1220,6 +1571,7 @@ def cmd_transcript(args: argparse.Namespace) -> int:
                 lecture_url=args.lecture_url,
                 output_dir=args.output_dir,
                 tag="Transcript",
+                force_transcribe=getattr(args, "force_transcribe", False),
             )
             fut_slide = executor.submit(
                 _run_slide_job,
@@ -1244,9 +1596,13 @@ def cmd_transcript(args: argparse.Namespace) -> int:
             return transcript_code
         if slide_code != 0:
             print("[Transcript] Slide download failed or incomplete; transcript artifacts are still kept.")
+        if workspace is not None:
+            _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
+                lecture_url=args.lecture_url, transcript_output_dir=Path(args.output_dir),
+                slide_output_dir=workspace.raw_slides_dir, note_style="", slides_regenerated=True)
         return 0
 
-    return _run_transcript_job(
+    result = _run_transcript_job(
         client=client,
         username=username,
         course_id=course_id,
@@ -1254,10 +1610,17 @@ def cmd_transcript(args: argparse.Namespace) -> int:
         lecture_url=args.lecture_url,
         output_dir=args.output_dir,
         tag="Transcript",
+        force_transcribe=getattr(args, "force_transcribe", False),
     )
+    if result == 0 and workspace is not None:
+        _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
+            lecture_url=args.lecture_url, transcript_output_dir=Path(args.output_dir),
+            slide_output_dir=workspace.raw_slides_dir, note_style="")
+    return result
 
 
 def cmd_slide(args: argparse.Namespace) -> int:
+    workspace = None
     try:
         client, username = _ensure_authenticated_client(force_login=args.force_login)
     except Exception as e:
@@ -1281,7 +1644,7 @@ def cmd_slide(args: argparse.Namespace) -> int:
         except Exception as e:
             _print_err(f"Workspace setup failed: {e}")
             return 1
-    return _run_slide_job(
+    result = _run_slide_job(
         client=client,
         username=username,
         course_id=course_id,
@@ -1296,6 +1659,28 @@ def cmd_slide(args: argparse.Namespace) -> int:
         timeout=args.timeout,
         tag="Slide",
     )
+    if result == 0 and workspace is not None:
+        # A slide-only lecture has no transcript filename from which the GUI
+        # can infer IDs. Record identity without replacing existing artifacts.
+        manifest = {}
+        if workspace.manifest_path.is_file():
+            try:
+                saved = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
+                manifest = saved if isinstance(saved, dict) else {}
+            except (OSError, ValueError):
+                pass
+        manifest.update({"course_id": course_id, "sub_id": sub_id,
+                         "course_title": workspace.course_title, "session_title": workspace.session_title})
+        manifest.setdefault("base_name", f"{course_id}_{sub_id}")
+        manifest.setdefault("generated_at", _now_iso())
+        manifest.setdefault("lecture_url", args.lecture_url or "")
+        recorded = manifest.get("artifacts")
+        recorded = dict(recorded) if isinstance(recorded, dict) else {}
+        recorded.update({"slides_dir": str(Path(args.output_dir).resolve()),
+                         "slide_index": str(Path(args.output_dir).resolve() / "index.json")})
+        manifest["artifacts"] = recorded
+        write_manifest(workspace, manifest)
+    return result
 
 
 def cmd_note(args: argparse.Namespace) -> int:
@@ -1354,6 +1739,7 @@ def cmd_note(args: argparse.Namespace) -> int:
             lecture_url=args.lecture_url,
             output_dir=args.output_dir,
             tag="Transcript",
+            force_transcribe=getattr(args, "force_transcribe", False),
         )
         fut_slide = None
         if not args.no_slide:
@@ -1390,6 +1776,7 @@ def cmd_note(args: argparse.Namespace) -> int:
         slide_output_dir=slide_output_dir,
         imported_materials=imported_materials,
         note_style=args.note_style,
+        slides_regenerated=not args.no_slide,
     )
 
     # Duration check: warn if < 1 hour (non-blocking)
@@ -1455,14 +1842,19 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 
 def cmd_cheatsheet(args: argparse.Namespace) -> int:
-    template_dir = _skill_root() / ".mock-wiki" / "CheatingSheetTemplate"
+    template_dir = _cheatsheet_template_dir()
+    if template_dir is None:
+        _print_err("CheatingSheetTemplate/CheatingSheet.tex not found.")
+        _print_err(
+            "Searched: "
+            + ", ".join(str(p) for p in (
+                _skill_root() / "CheatingSheetTemplate",
+                _skill_root() / ".mock-wiki" / "CheatingSheetTemplate",
+            ))
+        )
+        return 1
     tex_path = template_dir / "CheatingSheet.tex"
     readme_path = template_dir / "README.md"
-
-    if not tex_path.exists():
-        _print_err(".mock-wiki/CheatingSheetTemplate/CheatingSheet.tex not found.")
-        _print_err(f"Expected at: {tex_path}")
-        return 1
 
     output_format = (args.format or "html").strip().lower()
     if output_format not in ("tex", "html"):
@@ -1587,7 +1979,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_list.add_argument("--choose", type=int, default=None, help="Auto-select course number (1-based)")
     p_list.add_argument("--force-login", action="store_true", help="Ignore cached JWT and login again")
+    p_list.add_argument("--json", dest="json_output", action="store_true", help="Emit machine-readable JSON")
+    p_list.add_argument("--no-prompt", action="store_true", help="Never prompt; just print the list")
     p_list.set_defaults(func=cmd_list)
+
+    p_lectures = sub.add_parser("lectures", help="List lectures (sections) of a course as JSON")
+    p_lectures.add_argument("--course-id", default="", help="Course ID")
+    p_lectures.add_argument("--lecture-url", default="", help="Lecture page URL (course_id parsed from it)")
+    p_lectures.add_argument("--force-login", action="store_true", help="Ignore cached JWT and login again")
+    p_lectures.add_argument("--json", dest="json_output", action="store_true", help="Emit machine-readable JSON")
+    p_lectures.set_defaults(func=cmd_lectures)
+
+    p_status = sub.add_parser("status", help="Report environment and configuration state")
+    p_status.add_argument("--json", dest="json_output", action="store_true", help="Emit machine-readable JSON")
+    p_status.set_defaults(func=cmd_status)
 
     p_transcript = sub.add_parser("transcribe", aliases=["transcript", "trans"], help="Transcribe one lecture to SRT/TXT")
     p_transcript.add_argument("--lecture-url", default="", help="Tongji lecture page URL (best-effort parsing)")
@@ -1600,6 +2005,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_transcript.add_argument("--site-name", default="", help="Course wiki site name")
     p_transcript.add_argument("--no-workspace-prompt", action="store_true", help="Do not prompt for workspace config")
     p_transcript.add_argument("--force-login", action="store_true", help="Ignore cached JWT and login again")
+    p_transcript.add_argument("--force-transcribe", action="store_true", help="Ignore saved subtitles and audio; download and transcribe again")
     p_transcript.add_argument("--slide", action="store_true", help="Also download slides in parallel with transcription")
     p_transcript.add_argument("--per-page", type=int, default=100, help="search-ppt per_page parameter (slide download)")
     p_transcript.add_argument("--max-pages", type=int, default=20, help="Max pages to request from search-ppt (slide download)")
@@ -1618,6 +2024,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("--output-dir", default="", help="Output directory for all lectures (default: per-lecture workspace)")
     p_batch.add_argument("--max-retries", type=int, default=3, help="Max retries per failed lecture")
     p_batch.add_argument("--force-login", action="store_true", help="Ignore cached JWT and login again")
+    p_batch.add_argument("--force-transcribe", action="store_true", help="Ignore saved subtitles/audio for pending lectures")
+    p_batch.add_argument("--retry-failed", action="store_true", help="Retry exhausted failures; completed lectures stay completed")
     p_batch.set_defaults(func=cmd_batch_transcribe)
 
     p_slide = sub.add_parser("slide", help="Download lecture slide snapshots for one lecture")
@@ -1674,6 +2082,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Note writing style: standard (lecture notes) or dialogue (Q&A format)",
     )
     p_note.add_argument("--force-login", action="store_true", help="Ignore cached JWT and login again")
+    p_note.add_argument("--force-transcribe", action="store_true", help="Ignore saved subtitles and audio; download and transcribe again")
     p_note.set_defaults(func=cmd_note)
 
     p_add = sub.add_parser("add", help="Import materials into a lecture workspace without transcription")

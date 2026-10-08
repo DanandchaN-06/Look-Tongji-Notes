@@ -977,8 +977,8 @@ def _render_llmwiki_source(manifest_path: Path, manifest: dict[str, Any], *, sit
         f"sessionId: {manifest.get('base_name') or session_slug}",
         f"slug: {session_slug}",
         f"project: {project_slug}",
-        f"started: {generated_at or f'{date or '1970-01-01'}T00:00:00+08:00'}",
-        f"ended: {generated_at or f'{date or '1970-01-01'}T00:00:00+08:00'}",
+        f"started: {generated_at or (date or '1970-01-01') + 'T00:00:00+08:00'}",
+        f"ended: {generated_at or (date or '1970-01-01') + 'T00:00:00+08:00'}",
         f"cwd: {raw_root}",
         "gitBranch: main",
         "permissionMode: default",
@@ -1048,20 +1048,9 @@ def index_workspace_wiki(config: WorkspaceConfig) -> list[Path]:
 
 
 def build_workspace_wiki(config: WorkspaceConfig) -> Path:
-    synced = index_workspace_wiki(config)
+    index_workspace_wiki(config)
     site_dir = config.workspace_root / "site"
-    if not synced:
-        site_dir.mkdir(parents=True, exist_ok=True)
-        (site_dir / "index.html").write_text(
-            "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n"
-            "<title>" + (config.site_name or "Course Wiki") + "</title>\n"
-            "</head>\n<body>\n<h1>" + (config.site_name or "Course Knowledge Base") + "</h1>\n"
-            "<p>No lectures indexed yet. Transcribe a lecture with /trans or /note to populate the wiki.</p>\n"
-            "</body>\n</html>\n",
-            encoding="utf-8",
-        )
-        return site_dir
-    _run_llmwiki(config.workspace_root, "build", "--out", str(site_dir), "--seed-project-stubs")
+    _run_llmwiki(config.workspace_root, "build", "--out", str(site_dir), "--seed-project-stubs", "--allow-empty")
     return site_dir
 
 
