@@ -71,7 +71,7 @@ class FeatureTests(unittest.TestCase):
             target.write_text('<html>示例速查表</html>', encoding='utf-8')
             with patch.object(agent_bridge, '_workspace_root', return_value=root), patch.object(agent_bridge,'course_notes',return_value=[]), patch.object(agent_bridge, 'detect_artifacts', return_value={}):
                 result = agent_bridge.build_agent_instruction(kind='cheatsheet',course_id='101',cheatsheet_scope='course',cheatsheet_output='review.html')
-                self.assertIn(target.as_posix(), result['instruction'])
+                self.assertIn(target.resolve().as_posix(), result['instruction'])
                 checked = agent_bridge.verify_agent_output(kind='cheatsheet',course_id='101',sub_id='',cheatsheet_scope='course',cheatsheet_output='review.html')
                 self.assertTrue(checked['ready'])
             with self.assertRaises(ValueError):
