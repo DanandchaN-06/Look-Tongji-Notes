@@ -13,9 +13,11 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .core import ENV_PATH, REPO_ROOT, SCRIPTS_DIR, VISION_CONFIG_PATH, VISION_DIR
 
@@ -158,6 +160,178 @@ def write_env(updates: dict[str, str]) -> None:
         os.chmod(ENV_PATH, 0o600)
     except OSError:
         pass
+
+
+def console_user_config_dir() -> Path:
+    """Return the per-user config directory, with an isolated test override."""
+    override = os.environ.get("LOOK_TONGJI_CONSOLE_CONFIG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    if os.environ.get("APPDATA"):
+        base = Path(os.environ["APPDATA"])
+    elif os.environ.get("XDG_CONFIG_HOME"):
+        base = Path(os.environ["XDG_CONFIG_HOME"])
+    else:
+        base = Path.home() / ".config"
+    return base / "look-tongji"
+
+
+def console_settings_path() -> Path:
+    return console_user_config_dir() / "console-settings.json"
+
+
+def text_model_config_path() -> Path:
+    return console_user_config_dir() / "text-model.json"
+
+
+def _read_private_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as error:
+        raise ValueError(f"本地设置文件无法读取：{path.name}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"本地设置文件格式无效：{path.name}")
+    return payload
+
+
+def _atomic_private_json_write(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temp_path = Path(stream.name)
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        try:
+            os.chmod(temp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(temp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def _merge_config(existing: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_config(merged[key], value)
+        elif isinstance(value, dict):
+            merged[key] = _merge_config({}, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def read_console_settings() -> dict[str, Any]:
+    return _read_private_json(console_settings_path())
+
+
+def write_console_settings(updates: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(updates, dict):
+        raise ValueError("控制台设置必须是 JSON 对象")
+    path = console_settings_path()
+    merged = _merge_config(_read_private_json(path), updates)
+    _atomic_private_json_write(path, merged)
+    return merged
+
+
+def _validated_model_base_url(value: str) -> str:
+    base_url = value.strip()
+    parsed = urlsplit(base_url)
+    hostname = (parsed.hostname or "").lower()
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if (
+        parsed.scheme not in ("http", "https")
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(char.isspace() for char in base_url)
+        or (parsed.scheme == "http" and hostname not in local_hosts)
+    ):
+        raise ValueError("模型地址必须使用 HTTPS；本机服务可使用 localhost HTTP，且不能包含凭据或查询参数")
+    return base_url.rstrip("/")
+
+
+def read_text_model() -> dict[str, Any]:
+    return _read_private_json(text_model_config_path())
+
+
+def public_text_model() -> dict[str, Any]:
+    saved = read_text_model()
+    provider = str(saved.get("provider") or "")
+    model = str(saved.get("model") or "")
+    try:
+        base_url = _validated_model_base_url(str(saved.get("baseUrl") or "")) if saved.get("baseUrl") else ""
+    except ValueError:
+        base_url = ""
+    key_set = bool(str(saved.get("apiKey") or ""))
+    configured = bool(model and base_url and (key_set or provider == "ollama"))
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+        "key_configured": key_set,
+        "configured": configured,
+        "providers": ["openai-compatible", "ollama"],
+    }
+
+
+def save_text_model(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    clear_api_key: bool = False,
+) -> dict[str, Any]:
+    existing = read_text_model()
+    provider = (provider or existing.get("provider") or "openai-compatible").strip().lower()
+    if provider not in {"openai-compatible", "ollama"}:
+        raise ValueError("未知的文本模型平台")
+    model = (model if model is not None else existing.get("model") or "").strip()
+    if len(model) > 200 or any(char in model for char in "\r\n\0"):
+        raise ValueError("模型名称无效")
+    base_url = (base_url if base_url is not None else existing.get("baseUrl") or "").strip()
+    resolved_base = _validated_model_base_url(base_url) if base_url else ""
+    if base_url and len(base_url) > 2048:
+        raise ValueError("模型地址过长")
+    old_key = str(existing.get("apiKey") or "")
+    same_endpoint = provider == existing.get("provider") and resolved_base == existing.get("baseUrl")
+    if clear_api_key:
+        resolved_key = ""
+    elif api_key and api_key.strip():
+        resolved_key = api_key.strip()
+    elif same_endpoint:
+        resolved_key = old_key
+    else:
+        resolved_key = ""
+    if len(resolved_key) > 4096 or "\0" in resolved_key:
+        raise ValueError("文本模型密钥无效")
+
+    payload = dict(existing)
+    payload.update(
+        {
+            "provider": provider,
+            "model": model,
+            "baseUrl": resolved_base,
+            "apiKey": resolved_key,
+        }
+    )
+    _atomic_private_json_write(text_model_config_path(), payload)
+    return public_text_model()
 
 
 def public_credentials() -> dict[str, Any]:
