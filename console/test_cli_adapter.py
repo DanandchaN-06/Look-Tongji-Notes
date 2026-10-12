@@ -1,5 +1,7 @@
 """Offline checks for CLI -> console material discovery."""
 import json
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,32 @@ from unittest.mock import patch
 
 from console import agent_bridge
 from scripts import look_tongji as cli
+
+
+class CourseSearchResults(unittest.TestCase):
+    def test_json_search_with_no_match_is_empty_success(self):
+        client = SimpleNamespace(get_all_courses=lambda: [{'course_id': '101', 'title': '示例课程', 'teacher': '示例教师'}])
+        args = cli.build_parser().parse_args(['list', '--all', '--json', '--no-prompt', '--query', '不存在的教师'])
+        out = io.StringIO()
+        with patch.object(cli, '_ensure_authenticated_client', return_value=(client, 'QA')), contextlib.redirect_stdout(out):
+            result = cli.cmd_list(args)
+        self.assertEqual(result, 0)
+        data = json.loads(out.getvalue().splitlines()[-1])
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['courses'], [])
+
+    def test_text_search_keeps_existing_no_match_exit_status(self):
+        client = SimpleNamespace(get_all_courses=lambda: [{'course_id': '101', 'title': '示例课程', 'teacher': '示例教师'}])
+        args = cli.build_parser().parse_args(['list', '--all', '--no-prompt', '--query', '不存在的教师'])
+        with patch.object(cli, '_ensure_authenticated_client', return_value=(client, 'QA')), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.cmd_list(args), 1)
+
+    def test_authentication_failure_is_not_empty_success(self):
+        args = cli.build_parser().parse_args(['list', '--all', '--json', '--no-prompt'])
+        out = io.StringIO()
+        with patch.object(cli, '_ensure_authenticated_client', side_effect=RuntimeError('会话失效')), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.cmd_list(args), 1)
+        self.assertEqual(out.getvalue(), '')
 
 
 class SlideDiscovery(unittest.TestCase):
