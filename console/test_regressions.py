@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from console import agent_bridge, config_store
-from console.server import make_server, Handler
+from console.server import V2_STATIC_DIR, make_server, Handler
 from console.runner import TaskManager
 
 
@@ -61,6 +61,38 @@ class HttpRegressions(unittest.TestCase):
         self.assertIn("SameSite=Strict", cookie)
         self.assertEqual(self.request("/", headers={"X-Console-Token": "", "Cookie": cookie.split(";")[0]})[0], 200)
 
+    def test_v2_index_requires_session_token_and_sets_cookie(self):
+        self.assertEqual(self.request("/v2/", headers={"X-Console-Token": ""})[0], 403)
+        code, headers, body = self.request("/v2/?token=test-session-token", headers={"X-Console-Token": ""})
+        self.assertEqual(code, 200)
+        self.assertIn("/assets/", body.decode("utf-8"))
+        self.assertIn("HttpOnly", headers.get("Set-Cookie", ""))
+
+    def test_v2_assets_are_manifest_allowlisted_and_traversal_is_rejected(self):
+        manifest = json.loads((V2_STATIC_DIR / ".vite" / "manifest.json").read_text(encoding="utf-8"))
+        asset = manifest["index.html"]["file"]
+        code, headers, body = self.request(f"/v2/{asset}", headers={"X-Console-Token": ""})
+        self.assertEqual(code, 200)
+        self.assertGreater(len(body), 100)
+        self.assertIn("default-src 'self'", headers.get("Content-Security-Policy", ""))
+        self.assertEqual(self.request("/v2/%2e%2e/server.py")[0], 403)
+        self.assertEqual(self.request("/v2/server.py")[0], 403)
+
+    def test_reader_reuses_console_server_and_rejects_workspace_escape(self):
+        with tempfile.TemporaryDirectory() as folder:
+            site = Path(folder) / "site"
+            site.mkdir()
+            (site / "index.html").write_text("preserved reading page", encoding="utf-8")
+            reader = SimpleNamespace(site_dir=site)
+            router = SimpleNamespace(reader=reader)
+            state = self.server.RequestHandlerClass.state
+            with patch.object(state, "v2_router", return_value=router):
+                status, _, body = self.request("/reader/?token=test-session-token")
+                self.assertEqual(status, 200)
+                self.assertEqual(body.decode("utf-8"), "preserved reading page")
+                status, _, _ = self.request("/reader/%2e%2e/server.py?token=test-session-token")
+                self.assertEqual(status, 404)
+
     def test_other_local_port_origin_is_rejected(self):
         self.assertEqual(self.request("/api/task-kinds", headers={"Origin": f"http://localhost:{self.port + 1}"})[0], 403)
 
@@ -105,7 +137,7 @@ class TaskRegressions(unittest.TestCase):
             self.assertTrue(executed.wait(2))
             manager.shutdown()
 
-    def test_failed_thread_start_rolls_back_queue(self):
+    def test_failed_scheduler_start_rolls_back_queue(self):
         manager = TaskManager()
         with patch("console.runner.threading.Thread.start", side_effect=RuntimeError("test")):
             with self.assertRaises(ValueError):
@@ -140,8 +172,7 @@ class TaskRegressions(unittest.TestCase):
                 gates[1].set()
                 self.assertFalse(executed[1].wait(.2))
                 gates[0].set()
-                for thread in list(manager._threads.values()):
-                    thread.join(3)
+                self.assertTrue(all(event.wait(3) for event in executed))
                 self.assertEqual(order, [0, 1, 2])
             finally:
                 for gate in gates:
@@ -150,7 +181,7 @@ class TaskRegressions(unittest.TestCase):
 
     def test_mutating_tasks_are_queued_and_queued_cancel_does_not_execute(self):
         manager = TaskManager()
-        entered, release, second_entered = threading.Event(), threading.Event(), threading.Event()
+        entered, release, second_entered, first_done = (threading.Event() for _ in range(4))
         def fake_execute(task, env):
             if task.kind == "index":
                 entered.set()
@@ -158,6 +189,8 @@ class TaskRegressions(unittest.TestCase):
             else:
                 second_entered.set()
             task.status = "succeeded"
+            if task.kind == "index":
+                first_done.set()
         with patch.object(manager, "_execute", side_effect=fake_execute, create=True), patch("console.runner.subprocess.Popen", side_effect=RuntimeError("unexpected execution")):
             first = manager.start("index", {})
             self.assertTrue(entered.wait(2))
@@ -165,8 +198,7 @@ class TaskRegressions(unittest.TestCase):
             manager.cancel(second.id)
             self.assertFalse(second_entered.wait(.2))
             release.set()
-            for thread in list(manager._threads.values()):
-                thread.join(3)
+            self.assertTrue(first_done.wait(2))
             self.assertEqual(second.status, "cancelled")
         self.assertEqual(first.status, "succeeded")
 
