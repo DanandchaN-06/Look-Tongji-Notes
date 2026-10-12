@@ -234,10 +234,12 @@
         <div class="card">
           <div class="row between">
             <h2 id="taskDetailTitle">选择任务查看进度</h2>
+            <button class="btn btn-sm btn-primary" id="btnRetryTask" hidden>重试任务</button>
             <button class="btn btn-sm btn-danger" id="btnCancelTask" hidden>取消任务</button>
           </div>
           <div id="taskProgress" class="task-progress" hidden aria-live="polite"><div class="row between"><strong id="taskStage"></strong><span id="taskPercent"></span></div><progress id="taskProgressBar" max="100" aria-label="任务进度"></progress><div id="taskTracks"></div><p id="taskElapsed" class="hint"></p><p id="taskProgressHint" class="hint"></p></div>
           <button class="btn btn-primary" id="btnTaskNext" hidden>继续下一步</button>
+          <p id="taskRecoveryHint" class="hint" hidden aria-live="polite"></p>
           <details class="task-log-details" open><summary>详细日志</summary>
           <pre id="taskLog" class="log">选择一个任务查看日志。</pre>
           </details>
