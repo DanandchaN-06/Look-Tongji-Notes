@@ -1,7 +1,7 @@
 """Launcher for the Look Tongji Notes console.
 
 Usage:
-    python console/start.py [--port 8766] [--no-window] [--print-url]
+    python console/start.py [--port 8766] [--no-window] [--print-url] [--v2]
 
 It will:
 1. make sure it runs on an interpreter that has the CLI dependencies,
@@ -170,11 +170,17 @@ def open_window(url: str) -> None:
     print("[console] 已用默认浏览器打开。")
 
 
+def console_url(port: int, token: str, *, v2: bool = False) -> str:
+    route = "/v2/" if v2 else "/"
+    return f"http://127.0.0.1:{port}{route}?token={token}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Look Tongji Notes 本地控制台")
     parser.add_argument("--port", type=int, default=None, help="指定端口（默认自动选择）")
     parser.add_argument("--no-window", action="store_true", help="不自动打开窗口")
     parser.add_argument("--print-url", action="store_true", help="只打印访问地址")
+    parser.add_argument("--v2", action="store_true", help="打开 V2 管理器")
     args = parser.parse_args()
     if args.port is not None and not 1 <= args.port <= 65535:
         parser.error("端口必须介于 1 和 65535 之间")
@@ -186,7 +192,7 @@ def main() -> int:
     token = secrets.token_urlsafe(24)
     port = pick_port(args.port)
     httpd = make_server("127.0.0.1", port, token)
-    url = f"http://127.0.0.1:{port}/?token={token}"
+    url = console_url(port, token, v2=args.v2)
 
     print()
     print("  Look Tongji Notes 控制台", flush=True)
