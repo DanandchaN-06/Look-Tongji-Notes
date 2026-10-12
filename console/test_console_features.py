@@ -26,7 +26,7 @@ class FeatureTests(unittest.TestCase):
             raw = Path(folder)
             manifest = raw / 'manifest.json'
             manifest.write_text(json.dumps({'teacher': '示例教师', 'date': '2026-10-08', 'lecture_url': 'example', 'note_style': 'dialogue', 'artifacts': {'slides_dir': 'custom/slides', 'timeline_txt': 'custom/timeline.txt'}}), encoding='utf-8')
-            ws = SimpleNamespace(manifest_path=manifest, course_title='测试课程', session_title='第1讲')
+            ws = SimpleNamespace(manifest_path=manifest, raw_root=raw, course_title='测试课程', session_title='第1讲')
             with patch.object(cli, 'write_manifest') as write:
                 cli._write_lecture_manifest_from_outputs(workspace=ws, course_id='101', sub_id='202', lecture_url='', transcript_output_dir=raw, slide_output_dir=raw/'slides', note_style='')
             result = write.call_args.args[1]
