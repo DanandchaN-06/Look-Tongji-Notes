@@ -10,6 +10,7 @@ __pycache__/
 .mock-wiki/
 vision-support/config.json
 vision-support/.env
+console/frontend/node_modules/
 
 # Portable builds and personal launcher state
 release/
