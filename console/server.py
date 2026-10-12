@@ -19,6 +19,8 @@ import shutil
 import subprocess
 import socket
 import sys
+import threading
+from urllib.parse import unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie, CookieError
 from pathlib import Path
@@ -38,8 +40,10 @@ from .core import (
     redact,
 )
 from .runner import TASK_KINDS, TaskManager
+from .storage import ConsoleStorage
 
 STATIC_FILES = {"index.html", "app.css", "app.js", "task-progress.js"}
+V2_STATIC_DIR = WEB_DIR / "v2"
 
 # Bodies are small JSON payloads; anything larger is refused rather than buffered.
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -53,6 +57,72 @@ class ConsoleState:
     def __init__(self, token: str) -> None:
         self.token = token
         self.tasks = TaskManager()
+        self._v2_lock = threading.Lock()
+        self._v2_router = None
+
+    def v2_router(self):
+        if self._v2_router is not None:
+            return self._v2_router
+        with self._v2_lock:
+            if self._v2_router is None:
+                from .course_service import CourseService
+                from .routes_v2 import V2Router
+                from .settings_service import SettingsService
+                from .workflow_service import WorkflowService
+                from .reader_service import ReaderBuildService
+                from .migration import MigrationService
+
+                def account_identity():
+                    username = str(config_store.read_env().get("TONGJI_USERNAME") or "").strip()
+                    return ("tongji", username) if username else None
+
+                def workspace_root():
+                    config = config_store.load_workspace_config()
+                    return config.workspace_root if config else None
+
+                storage = ConsoleStorage()
+                courses = CourseService(
+                    storage,
+                    account_identity=account_identity,
+                    workspace_root=workspace_root,
+                )
+                settings = SettingsService(storage)
+                workflows = WorkflowService(storage, courses, settings, self.tasks)
+                workflows.recover_orphans()
+                configured_root = workspace_root()
+                reader = ReaderBuildService(storage, configured_root) if configured_root else None
+
+                def migration_config_paths():
+                    paths = [
+                        config_store.ENV_PATH,
+                        config_store.console_settings_path(),
+                        config_store.text_model_config_path(),
+                        config_store.VISION_CONFIG_PATH,
+                    ]
+                    workspace_config = config_store.load_workspace_config()
+                    if workspace_config is not None:
+                        paths.append(workspace_config.config_path)
+                    return paths
+
+                migration = MigrationService(
+                    storage, workspace_root,
+                    backup_sources=migration_config_paths,
+                )
+                self._v2_router = V2Router(
+                    courses, settings, workflows, reader_service=reader, migration_service=migration
+                )
+        return self._v2_router
+
+    def close_v2_thread_connection(self) -> None:
+        if self._v2_router is not None:
+            self._v2_router.courses.storage.close_thread_connection()
+
+    def shutdown(self) -> None:
+        self.tasks.shutdown()
+        if self._v2_router is not None and self._v2_router.workflows is not None:
+            self._v2_router.workflows.shutdown()
+        if self._v2_router is not None and self._v2_router.reader is not None:
+            self._v2_router.reader.shutdown()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -193,6 +263,24 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_static("index.html")
             return
 
+        if parsed.path in ("/v2", "/v2/"):
+            if not self._token_ok(query):
+                self._send_text("无效或缺失的访问令牌。请从控制台启动器打开页面。", 403)
+                return
+            self._serve_v2_static("index.html", set_cookie=True)
+            return
+
+        if parsed.path == "/reader" or parsed.path.startswith("/reader/"):
+            if not self._token_ok(query):
+                self._send_text("请从课程助手打开阅读页。", 403)
+                return
+            self._serve_reader_file(parsed.path)
+            return
+
+        if parsed.path.startswith("/v2/"):
+            self._serve_v2_static(parsed.path.removeprefix("/v2/"))
+            return
+
         # Static assets carry no secrets and are referenced without a token by
         # the HTML. Every /api/* route still requires the token.
         if parsed.path in ("/app.css", "/app.js", "/task-progress.js"):
@@ -279,10 +367,66 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_v2_static(self, name: str, *, set_cookie: bool = False) -> None:
+        if not name or "%" in name or "\\" in name or "\0" in name:
+            self._send_text("forbidden", 403)
+            return
+        manifest_path = V2_STATIC_DIR / ".vite" / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self._send_text("V2 静态资源尚未构建", 503)
+            return
+        allowed = {"index.html"}
+        if isinstance(manifest, dict):
+            for entry in manifest.values():
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("file", "css", "assets"):
+                    values = entry.get(key, [])
+                    values = [values] if isinstance(values, str) else values
+                    if isinstance(values, list):
+                        allowed.update(value for value in values if isinstance(value, str))
+        if name not in allowed:
+            self._send_text("forbidden", 403)
+            return
+        relative = Path(*name.split("/"))
+        root = V2_STATIC_DIR.resolve()
+        target = (root / relative).resolve()
+        if root not in target.parents or not target.is_file():
+            self._send_text("not found", 404)
+            return
+        body = target.read_bytes()
+        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in {"application/javascript", "application/json"}:
+            content_type += "; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+            "form-action 'self'; object-src 'none'",
+        )
+        if set_cookie:
+            self.send_header("Set-Cookie", f"{self._cookie_name()}={self.state.token}; Path=/; HttpOnly; SameSite=Strict")
+        self.end_headers()
+        self.wfile.write(body)
+
     # -- routing -----------------------------------------------------------
 
     def _route_get(self, path: str, query: dict[str, list[str]], parsed: Any) -> None:
-        if path == "/api/status":
+        if path.startswith("/api/v2/"):
+            try:
+                status, payload = self.state.v2_router().get(path, query)
+                self._send_json(payload, status)
+            finally:
+                self.state.close_v2_thread_connection()
+        elif path == "/api/status":
             self._api_status()
         elif path == "/api/config":
             self._send_json({
@@ -326,9 +470,52 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json({"ok": False, "error": "未找到"}, 404)
 
+    def _serve_reader_file(self, request_path: str) -> None:
+        router = self.state.v2_router()
+        reader = router.reader
+        if reader is None:
+            self._send_text("尚未配置阅读资料库。", 404)
+            return
+        relative = unquote(request_path.removeprefix("/reader")).lstrip("/")
+        if not relative:
+            relative = "index.html"
+        target = (reader.site_dir / relative).resolve()
+        try:
+            if not target.is_relative_to(reader.site_dir.resolve()):
+                self._send_text("未找到阅读页面。", 404)
+                return
+        except (OSError, ValueError):
+            self._send_text("未找到阅读页面。", 404)
+            return
+        if target.is_dir():
+            target = target / "index.html"
+        if not target.is_file():
+            self._send_text("未找到阅读页面。", 404)
+            return
+        try:
+            content = target.read_bytes()
+        except OSError:
+            self._send_text("阅读页面暂时无法读取。", 503)
+            return
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in {"application/javascript", "application/json", "image/svg+xml"}:
+            content_type += "; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-cache" if target.name == "index.html" else "private, max-age=300")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(content)
+
     def _route_post(self, path: str, body: dict[str, Any]) -> None:
         try:
-            if path == "/api/config/credentials":
+            if path.startswith("/api/v2/"):
+                status, payload = self.state.v2_router().post(
+                    path, body, idempotency_key=self.headers.get("Idempotency-Key") or ""
+                )
+                self._send_json(payload, status)
+            elif path == "/api/config/credentials":
                 self._api_save_credentials(body)
             elif path == "/api/lecture/resolve":
                 url = str(body.get("url") or "").strip()
@@ -365,6 +552,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": redact(str(exc))}, 400)
         except Exception as exc:  # pragma: no cover - defensive
             self._send_json({"ok": False, "error": redact(f"内部错误: {exc}")}, 500)
+        finally:
+            if path.startswith("/api/v2/"):
+                self.state.close_v2_thread_connection()
 
     # -- api: status -------------------------------------------------------
 
@@ -663,7 +853,7 @@ class Handler(BaseHTTPRequestHandler):
 
 class ConsoleHTTPServer(ThreadingHTTPServer):
     def server_close(self) -> None:
-        self.RequestHandlerClass.state.tasks.shutdown()
+        self.RequestHandlerClass.state.shutdown()
         super().server_close()
 
 
