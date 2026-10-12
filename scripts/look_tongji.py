@@ -23,6 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from tongji_backend.progress import emit as emit_progress
 from tongji_backend.checkpoints import path_for as checkpoint_path
 
@@ -278,9 +281,6 @@ def _build_client_from_jwt(jwt_token: str) -> TongjiClient | None:
 
 
 def _ensure_authenticated_client(force_login: bool = False) -> tuple[TongjiClient, str]:
-    from tongji_backend.auth import TongjiAuth
-    from tongji_backend.client import TongjiClient
-
     # 1) Try cached JWT first
     if not force_login:
         cached = _load_auth_session()
@@ -303,12 +303,30 @@ def _ensure_authenticated_client(force_login: bool = False) -> tuple[TongjiClien
             "or set TONGJI_USERNAME/TONGJI_PASSWORD in the environment."
         )
 
-    auth = TongjiAuth()
-    auth.login(username=username, password=password)
-    jwt_token = auth.get_jwt_token() or ""
-    if jwt_token:
-        _save_auth_session(AuthSession(username=username, jwt_token=jwt_token))
-    return TongjiClient(auth), username
+    from tongji_backend.auth import TongjiAuth
+    from tongji_backend.client import TongjiClient
+
+    with _account_auth_refresh_lock(username):
+        # Another process may have refreshed the same account while this
+        # process was checking the previous cached token.
+        if not force_login:
+            cached = _load_auth_session()
+            if cached:
+                client = _build_client_from_jwt(cached.jwt_token)
+                if client is not None:
+                    return client, cached.username
+        auth = TongjiAuth()
+        auth.login(username=username, password=password)
+        jwt_token = auth.get_jwt_token() or ""
+        if jwt_token:
+            _save_auth_session(AuthSession(username=username, jwt_token=jwt_token))
+        return TongjiClient(auth), username
+
+
+def _account_auth_refresh_lock(username: str):
+    from tongji_backend.media_cache import account_auth_refresh_lock
+
+    return account_auth_refresh_lock(_state_dir(), username)
 
 
 def _check_deps() -> list[str]:
@@ -489,7 +507,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             if query in _course_title(c).lower() or query in _course_teacher(c).lower()
         ]
 
-    if not courses:
+    if not courses and not getattr(args, "json_output", False):
         _print_err("No courses matched the query.")
         return 1
 
@@ -809,6 +827,7 @@ def _prepare_workspace_for_lecture(
     )
     detail = client.get_course_detail(course_id)
     lecture = _find_lecture_info(detail, sub_id)
+    detail = {**detail, 'course_id': course_id}
     return config, prepare_lecture_workspace(config, course_detail=detail, lecture=lecture)
 
 
@@ -851,7 +870,14 @@ def _collect_materials(args: argparse.Namespace) -> list[MaterialInput]:
     return materials
 
 
-def _write_lecture_manifest_from_outputs(
+def _write_lecture_manifest_from_outputs(**kwargs: Any) -> None:
+    workspace = kwargs["workspace"]
+    from tongji_backend.media_cache import lecture_lock
+    with lecture_lock(workspace.raw_root / ".manifest.lock"):
+        _write_lecture_manifest_from_outputs_unlocked(**kwargs)
+
+
+def _write_lecture_manifest_from_outputs_unlocked(
     *,
     workspace: Any,
     course_id: str,
@@ -862,6 +888,7 @@ def _write_lecture_manifest_from_outputs(
     imported_materials: list[dict[str, Any]] | None = None,
     note_style: str = "standard",
     slides_regenerated: bool = False,
+    defer_site_build: bool = False,
 ) -> None:
     base = f"{course_id}_{sub_id}"
     current_agent = _detect_current_agent()
@@ -915,7 +942,7 @@ def _write_lecture_manifest_from_outputs(
     manifest.pop("duration_warning", None)
     if 0 < dur < 3600:
         manifest["duration_warning"] = True
-    write_manifest(workspace, manifest)
+    write_manifest(workspace, manifest, defer_site_build=defer_site_build)
 
 
 def _resolve_course_sub(
@@ -1031,6 +1058,7 @@ def _run_transcript_job_locked(
     force_transcribe: bool = False,
 ) -> int:
     from tongji_backend.transcriber import NoAudioStreamError, Transcriber, TranscriptionError
+    from console.asr_providers import ASRCancelled
     from tongji_backend.media_tools import MediaToolError
     emit_progress("transcript", "prepare")
     out_dir = _output_dir(output_dir)
@@ -1058,7 +1086,11 @@ def _run_transcript_job_locked(
                     raise ValueError("音频缓存包含外部文件链接")
                 path.unlink(missing_ok=True)
         transcript, srt_content, utterances = transcriber.transcribe_url(
-            stream_url, http_headers=http_headers, audio_cache_path=cache
+            stream_url, http_headers=http_headers, audio_cache_path=cache,
+            cancel=lambda: bool(
+                os.environ.get("LOOK_TONGJI_BATCH_CANCEL_FILE")
+                and Path(os.environ["LOOK_TONGJI_BATCH_CANCEL_FILE"]).exists()
+            ),
         )
     except NoAudioStreamError as e:
         _print_err(f"No audio stream: {e}")
@@ -1066,6 +1098,9 @@ def _run_transcript_job_locked(
     except MediaToolError as e:
         _print_err(f"音频工具不可用，已停止转写：{e}")
         return 2
+    except ASRCancelled:
+        _print_err("字幕识别已取消；已下载的音频缓存会保留。")
+        return 130
     except TranscriptionError as e:
         _print_err(f"Transcription failed: {e}")
         return 1
@@ -1482,6 +1517,11 @@ def cmd_batch_transcribe(args: argparse.Namespace) -> int:
                 tag="Batch",
                 force_transcribe=getattr(args, "force_transcribe", False),
             )
+            if result == 130 or (cancel_path is not None and cancel_path.exists()):
+                item["status"] = "pending"
+                item["error"] = None
+                _save_state()
+                return 130
             if result == 0 and workspace is not None:
                 try:
                     _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
@@ -1599,7 +1639,8 @@ def cmd_transcript(args: argparse.Namespace) -> int:
         if workspace is not None:
             _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
                 lecture_url=args.lecture_url, transcript_output_dir=Path(args.output_dir),
-                slide_output_dir=workspace.raw_slides_dir, note_style="", slides_regenerated=True)
+                slide_output_dir=workspace.raw_slides_dir, note_style="", slides_regenerated=True,
+                defer_site_build=getattr(args, "defer_site_build", False))
         return 0
 
     result = _run_transcript_job(
@@ -1615,7 +1656,8 @@ def cmd_transcript(args: argparse.Namespace) -> int:
     if result == 0 and workspace is not None:
         _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
             lecture_url=args.lecture_url, transcript_output_dir=Path(args.output_dir),
-            slide_output_dir=workspace.raw_slides_dir, note_style="")
+            slide_output_dir=workspace.raw_slides_dir, note_style="",
+            defer_site_build=getattr(args, "defer_site_build", False))
     return result
 
 
@@ -1662,24 +1704,26 @@ def cmd_slide(args: argparse.Namespace) -> int:
     if result == 0 and workspace is not None:
         # A slide-only lecture has no transcript filename from which the GUI
         # can infer IDs. Record identity without replacing existing artifacts.
-        manifest = {}
-        if workspace.manifest_path.is_file():
-            try:
-                saved = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
-                manifest = saved if isinstance(saved, dict) else {}
-            except (OSError, ValueError):
-                pass
-        manifest.update({"course_id": course_id, "sub_id": sub_id,
-                         "course_title": workspace.course_title, "session_title": workspace.session_title})
-        manifest.setdefault("base_name", f"{course_id}_{sub_id}")
-        manifest.setdefault("generated_at", _now_iso())
-        manifest.setdefault("lecture_url", args.lecture_url or "")
-        recorded = manifest.get("artifacts")
-        recorded = dict(recorded) if isinstance(recorded, dict) else {}
-        recorded.update({"slides_dir": str(Path(args.output_dir).resolve()),
-                         "slide_index": str(Path(args.output_dir).resolve() / "index.json")})
-        manifest["artifacts"] = recorded
-        write_manifest(workspace, manifest)
+        from tongji_backend.media_cache import lecture_lock
+        with lecture_lock(workspace.raw_root / ".manifest.lock"):
+            manifest = {}
+            if workspace.manifest_path.is_file():
+                try:
+                    saved = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
+                    manifest = saved if isinstance(saved, dict) else {}
+                except (OSError, ValueError):
+                    pass
+            manifest.update({"course_id": course_id, "sub_id": sub_id,
+                             "course_title": workspace.course_title, "session_title": workspace.session_title})
+            manifest.setdefault("base_name", f"{course_id}_{sub_id}")
+            manifest.setdefault("generated_at", _now_iso())
+            manifest.setdefault("lecture_url", args.lecture_url or "")
+            recorded = manifest.get("artifacts")
+            recorded = dict(recorded) if isinstance(recorded, dict) else {}
+            recorded.update({"slides_dir": str(Path(args.output_dir).resolve()),
+                             "slide_index": str(Path(args.output_dir).resolve() / "index.json")})
+            manifest["artifacts"] = recorded
+            write_manifest(workspace, manifest, defer_site_build=getattr(args, "defer_site_build", False))
     return result
 
 
@@ -1777,6 +1821,7 @@ def cmd_note(args: argparse.Namespace) -> int:
         imported_materials=imported_materials,
         note_style=args.note_style,
         slides_regenerated=not args.no_slide,
+        defer_site_build=getattr(args, "defer_site_build", False),
     )
 
     # Duration check: warn if < 1 hour (non-blocking)
@@ -1789,6 +1834,13 @@ def cmd_note(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
+    return _build_workspace_if_requested(config, defer=getattr(args, "defer_site_build", False))
+
+
+def _build_workspace_if_requested(config: WorkspaceConfig, *, defer: bool) -> int:
+    if defer:
+        print("[Wiki] Site build deferred; workspace index will be refreshed by the build workflow.")
+        return 0
     try:
         site_dir = build_workspace_wiki(config)
         print(f"[Wiki] Built course site: {site_dir}")
@@ -2004,6 +2056,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_transcript.add_argument("--owner-name", default="", help="Owner name shown in the course wiki")
     p_transcript.add_argument("--site-name", default="", help="Course wiki site name")
     p_transcript.add_argument("--no-workspace-prompt", action="store_true", help="Do not prompt for workspace config")
+    p_transcript.add_argument("--defer-site-build", action="store_true", help="Defer shared workspace indexing and site build")
     p_transcript.add_argument("--force-login", action="store_true", help="Ignore cached JWT and login again")
     p_transcript.add_argument("--force-transcribe", action="store_true", help="Ignore saved subtitles and audio; download and transcribe again")
     p_transcript.add_argument("--slide", action="store_true", help="Also download slides in parallel with transcription")
@@ -2042,6 +2095,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_slide.add_argument("--owner-name", default="", help="Owner name shown in the course wiki")
     p_slide.add_argument("--site-name", default="", help="Course wiki site name")
     p_slide.add_argument("--no-workspace-prompt", action="store_true", help="Do not prompt for workspace config")
+    p_slide.add_argument("--defer-site-build", action="store_true", help="Defer shared workspace indexing and site build")
     p_slide.add_argument("--per-page", type=int, default=100, help="search-ppt per_page parameter")
     p_slide.add_argument("--max-pages", type=int, default=20, help="Max pages to request from search-ppt")
     p_slide.add_argument("--max-items", type=int, default=0, help="Download at most N snapshots (0 means all)")
@@ -2068,6 +2122,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_note.add_argument("--material", action="append", default=[], help="Supplementary material as name=path or path")
     p_note.add_argument("--no-material-prompt", action="store_true", help="Do not ask for supplementary materials")
     p_note.add_argument("--no-workspace-prompt", action="store_true", help="Do not prompt for workspace config")
+    p_note.add_argument("--defer-site-build", action="store_true", help="Defer shared workspace indexing and site build")
     p_note.add_argument("--no-slide", action="store_true", help="Skip slide download and run transcript only")
     p_note.add_argument("--per-page", type=int, default=100, help="search-ppt per_page parameter")
     p_note.add_argument("--max-pages", type=int, default=20, help="Max pages to request from search-ppt")
