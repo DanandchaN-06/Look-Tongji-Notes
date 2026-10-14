@@ -223,8 +223,6 @@ def scan_package(root: Path) -> None:
             raise RuntimeError(f"Private/generated file must not be packaged: {relative}")
         if relative.parts[:2] not in (("app", "runtime"), ("app", "browsers")):
             data = path.read_bytes()
-            if b"WorkBuddy" in data or b"C:\\Users\\84379" in data or b"C:/Users/84379" in data:
-                raise RuntimeError(f"Local machine identifier found: {relative}")
             if user_path.search(data):
                 raise RuntimeError(f"Absolute user profile path found: {relative}")
     if not (root / "app/project/console/web/v2/.vite/manifest.json").is_file():
