@@ -207,7 +207,11 @@ def write_quickstart(root: Path, version: str) -> None:
 
 def scan_package(root: Path) -> None:
     forbidden_names = EXCLUDED_NAMES | {"manager-service.json", "service.json", "server.log", "last-error.txt"}
-    user_path = re.compile(rb"(?i)(?:[a-z]:[\\/]+users[\\/]+)(?!public[\\/]|default[\\/]|all users[\\/])[^\\/\r\n]+")
+    user_path = re.compile(
+        rb"(?i)(?:[a-z]:[\\/]+users[\\/]+)"
+        rb"(?!public[\\/]|default[\\/]|all users[\\/]|<u>|<user>|<username>|%username%)"
+        rb"[^\\/\r\n]+"
+    )
     for path in root.rglob("*"):
         if not path.is_file():
             continue
