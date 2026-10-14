@@ -163,6 +163,8 @@ def launch(site, manager=False):
                            '--site', str(site), '--token', token]
                 if manager:
                     command.append('--manager')
+                else:
+                    command.append('--reader')
                 process = subprocess.Popen(
                     command, cwd=APP,
                     env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
