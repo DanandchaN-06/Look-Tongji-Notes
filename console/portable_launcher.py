@@ -1,4 +1,4 @@
-"""Persistent desktop entry for the existing reading site (stdlib only)."""
+"""Persistent desktop entry for the V2 manager and original reader (stdlib only)."""
 from __future__ import annotations
 
 import argparse
@@ -19,7 +19,7 @@ import webbrowser
 
 APP = Path(__file__).resolve().parent
 STATE = APP / 'data'
-IDENTITY = 'look-tongji-original-reader-v1'
+IDENTITY = 'look-tongji-manager-v2'
 
 
 def site_directory():
@@ -215,7 +215,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-open', action='store_true')
     parser.add_argument('--serve', action='store_true')
-    parser.add_argument('--manager', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--manager', dest='manager', action='store_true', help='启动 V2 管理器（默认）')
+    mode.add_argument('--reader', dest='manager', action='store_false', help='启动原有阅读网页')
+    parser.set_defaults(manager=True)
     parser.add_argument('--site')
     parser.add_argument('--token')
     args = parser.parse_args()

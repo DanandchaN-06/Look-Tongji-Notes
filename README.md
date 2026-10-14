@@ -2,7 +2,7 @@
 
 这是 [原项目](https://github.com/WALKERKILLER/Look-Tongji-Notes) 的 Fork，新增本地图形管理控制台，保留原有阅读网页、CLI 和 Agent 工作流。
 
-**普通 Windows 用户：[下载便携版](https://github.com/DanandchaN-06/Look-Tongji-Notes/releases/latest)**。完整解压后双击 `启动课程助手.cmd`，选 **1 管理控制台**，填写自己的账号和资料目录。首次字幕转写通过入口 **3** 安装 FFmpeg。无需先安装 Python 或运行 pip。
+**普通 Windows 用户：[下载便携版](https://github.com/DanandchaN-06/Look-Tongji-Notes/releases/latest)**。完整解压后双击 `启动课程助手.cmd`，选 **1 管理控制台（V2）**，再到设置页填写自己的账号和资料目录。首次字幕转写通过入口 **3** 安装 FFmpeg。已安装旧版可用入口 **4** 升级并保留设置。无需先安装 Python 或运行 pip。
 
 **[管理器详细使用指南](docs/MANAGER_GUIDE.md)** · **[本版发布说明](docs/MANAGER_RELEASE.md)** · **[源码运行说明](console/README.md)**
 
