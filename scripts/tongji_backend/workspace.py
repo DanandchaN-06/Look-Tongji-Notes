@@ -10,12 +10,15 @@ This module keeps all path and storage decisions in one place:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,6 +28,18 @@ _CONFIG_ENV = "LOOK_TONGJI_CONFIG_PATH"
 _WORKSPACE_ENV = "LOOK_TONGJI_WORKSPACE_ROOT"
 _OWNER_ENV = "LOOK_TONGJI_OWNER_NAME"
 _SITE_NAME_ENV = "LOOK_TONGJI_SITE_NAME"
+_WORKSPACE_LOCK_GUARD = threading.Lock()
+_WORKSPACE_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _workspace_mutation_lock(root: Path) -> threading.RLock:
+    key = str(root.expanduser().resolve())
+    with _WORKSPACE_LOCK_GUARD:
+        lock = _WORKSPACE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _WORKSPACE_LOCKS[key] = lock
+        return lock
 
 
 def _home_dir() -> Path:
@@ -101,7 +116,17 @@ def _ascii_slug(value: str, *, fallback: str) -> str:
 
 def _ensure_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(content.rstrip() + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _course_slug(course_id: str, course_title: str) -> str:
+    fallback = 'course-' + hashlib.sha256(course_title.encode('utf-8')).hexdigest()[:12]
+    return _ascii_slug(course_id, fallback=fallback)
 
 
 def _normalize_agent_name(value: str) -> str:
@@ -747,7 +772,7 @@ def prepare_lecture_workspace(
     )
     course_id = str(course_detail.get("course_id") or course_detail.get("id") or "").strip()
     sub_id = str(lecture.get("sub_id") or "").strip()
-    project_slug = _ascii_slug(course_id, fallback=f"course-{abs(hash(course_title)) % 10_000_000}")
+    project_slug = _course_slug(course_id, course_title)
     session_slug = _lecture_folder_name(lecture)
     source_slug = _ascii_slug(
         f"{lecture.get('date') or ''}-{sub_id or session_slug}",
@@ -905,12 +930,14 @@ def _render_llmwiki_source(manifest_path: Path, manifest: dict[str, Any], *, sit
     primary_agent = agents[0]
     date = ""
     session_folder = raw_root.parent.name
-    date_match = re.match(r"^(\d{4}-\d{2}-\d{2})", session_folder)
+    date_match = re.search(r"\d{4}-\d{2}-\d{2}", str(manifest.get('date') or session_title))
+    if not date_match:
+        date_match = re.match(r"^(\d{4}-\d{2}-\d{2})", session_folder)
     if date_match:
-        date = date_match.group(1)
+        date = date_match.group(0)
     elif generated_at:
         date = generated_at[:10]
-    project_slug = _ascii_slug(course_id, fallback=f"course-{abs(hash(course_title)) % 10_000_000}")
+    project_slug = _course_slug(course_id, course_title)
     session_slug = _ascii_slug(
         f"{date or generated_at[:10]}-{sub_id or session_title}",
         fallback=f"{project_slug}-{sub_id or 'session'}",
@@ -1009,23 +1036,24 @@ def _render_llmwiki_source(manifest_path: Path, manifest: dict[str, Any], *, sit
 
 
 def sync_manifest_to_llmwiki_source(config: WorkspaceConfig, manifest_path: Path) -> Path:
-    ensure_workspace_scaffold(config)
-    manifest = _read_json(manifest_path)
-    if not manifest:
-        raise RuntimeError(f"Invalid manifest: {manifest_path}")
-    project_slug, session_slug, source_text = _render_llmwiki_source(
-        manifest_path,
-        manifest,
-        site_name=config.site_name,
-    )
-    _seed_project_profile(
-        config.workspace_root,
-        project_slug,
-        str(manifest.get("course_title") or manifest_path.parents[2].name),
-    )
-    out_path = config.workspace_root / "raw" / "sessions" / project_slug / f"{session_slug}.md"
-    _ensure_text(out_path, source_text)
-    return out_path
+    with _workspace_mutation_lock(config.workspace_root):
+        ensure_workspace_scaffold(config)
+        manifest = _read_json(manifest_path)
+        if not manifest:
+            raise RuntimeError(f"Invalid manifest: {manifest_path}")
+        project_slug, session_slug, source_text = _render_llmwiki_source(
+            manifest_path,
+            manifest,
+            site_name=config.site_name,
+        )
+        _seed_project_profile(
+            config.workspace_root,
+            project_slug,
+            str(manifest.get("course_title") or manifest_path.parents[2].name),
+        )
+        out_path = config.workspace_root / "raw" / "sessions" / project_slug / f"{session_slug}.md"
+        _ensure_text(out_path, source_text)
+        return out_path
 
 
 def sync_all_manifests_to_llmwiki(config: WorkspaceConfig) -> list[Path]:
@@ -1042,16 +1070,43 @@ def sync_all_manifests_to_llmwiki(config: WorkspaceConfig) -> list[Path]:
 
 
 def index_workspace_wiki(config: WorkspaceConfig) -> list[Path]:
-    ensure_workspace_scaffold(config)
-    synced = sync_all_manifests_to_llmwiki(config)
-    return synced
+    with _workspace_mutation_lock(config.workspace_root):
+        ensure_workspace_scaffold(config)
+        return sync_all_manifests_to_llmwiki(config)
 
 
-def build_workspace_wiki(config: WorkspaceConfig) -> Path:
-    index_workspace_wiki(config)
-    site_dir = config.workspace_root / "site"
-    _run_llmwiki(config.workspace_root, "build", "--out", str(site_dir), "--seed-project-stubs", "--allow-empty")
-    return site_dir
+def build_workspace_wiki(config: WorkspaceConfig, *, out_dir: str | Path | None = None) -> Path:
+    with _workspace_mutation_lock(config.workspace_root):
+        index_workspace_wiki(config)
+        site_dir = Path(out_dir).resolve() if out_dir is not None else config.workspace_root / "site"
+        if out_dir is not None:
+            _run_llmwiki(config.workspace_root, "build", "--out", str(site_dir), "--seed-project-stubs", "--allow-empty")
+            return site_dir
+
+        temporary = config.workspace_root / f".site-build-{uuid.uuid4().hex}"
+        backup = config.workspace_root / f".site-backup-{uuid.uuid4().hex}"
+        moved_old = False
+        try:
+            _run_llmwiki(config.workspace_root, "build", "--out", str(temporary), "--seed-project-stubs", "--allow-empty")
+            index = temporary / "index.html"
+            if not index.is_file() or index.stat().st_size == 0:
+                raise RuntimeError("阅读站点构建未生成有效的 index.html")
+            if site_dir.exists():
+                os.replace(site_dir, backup)
+                moved_old = True
+            try:
+                os.replace(temporary, site_dir)
+            except BaseException:
+                if moved_old and backup.exists() and not site_dir.exists():
+                    os.replace(backup, site_dir)
+                    moved_old = False
+                raise
+            if moved_old:
+                shutil.rmtree(backup, ignore_errors=True)
+            return site_dir
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
 
 
 def serve_workspace_wiki(
@@ -1083,12 +1138,32 @@ def serve_workspace_wiki(
     )
 
 
-def write_manifest(workspace: LectureWorkspace, manifest: dict[str, Any]) -> None:
-    workspace.manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+def write_manifest(
+    workspace: LectureWorkspace,
+    manifest: dict[str, Any],
+    *,
+    defer_site_build: bool = False,
+) -> None:
+    session_identity = str(getattr(workspace, "session_title", "") or getattr(workspace, "session_slug", ""))
+    if session_identity:
+        manifest.setdefault("manifest_version", 1)
+        if not isinstance(manifest.get("artifacts"), dict):
+            manifest["artifacts"] = {}
+        if not manifest.get("date"):
+            date_match = re.search(r"\d{4}-\d{2}-\d{2}", session_identity)
+            if date_match:
+                manifest["date"] = date_match.group(0)
+    workspace.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = workspace.manifest_path.with_name(
+        f".{workspace.manifest_path.name}.{uuid.uuid4().hex}.tmp"
     )
-    config = load_workspace_config()
-    if config is None:
+    try:
+        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, workspace.manifest_path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    if defer_site_build:
         return
-    sync_manifest_to_llmwiki_source(config, workspace.manifest_path)
+    config = load_workspace_config()
+    if config is not None:
+        sync_manifest_to_llmwiki_source(config, workspace.manifest_path)

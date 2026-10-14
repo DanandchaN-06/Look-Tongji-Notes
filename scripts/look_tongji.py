@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 22483)
+Total output lines: 2204
+
 #!/usr/bin/env python3
 """CLI for Tongji Look (look.tongji.edu.cn): setup, list, transcribe.
 
@@ -23,6 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from tongji_backend.progress import emit as emit_progress
 from tongji_backend.checkpoints import path_for as checkpoint_path
 
@@ -278,9 +284,6 @@ def _build_client_from_jwt(jwt_token: str) -> TongjiClient | None:
 
 
 def _ensure_authenticated_client(force_login: bool = False) -> tuple[TongjiClient, str]:
-    from tongji_backend.auth import TongjiAuth
-    from tongji_backend.client import TongjiClient
-
     # 1) Try cached JWT first
     if not force_login:
         cached = _load_auth_session()
@@ -303,12 +306,30 @@ def _ensure_authenticated_client(force_login: bool = False) -> tuple[TongjiClien
             "or set TONGJI_USERNAME/TONGJI_PASSWORD in the environment."
         )
 
-    auth = TongjiAuth()
-    auth.login(username=username, password=password)
-    jwt_token = auth.get_jwt_token() or ""
-    if jwt_token:
-        _save_auth_session(AuthSession(username=username, jwt_token=jwt_token))
-    return TongjiClient(auth), username
+    from tongji_backend.auth import TongjiAuth
+    from tongji_backend.client import TongjiClient
+
+    with _account_auth_refresh_lock(username):
+        # Another process may have refreshed the same account while this
+        # process was checking the previous cached token.
+        if not force_login:
+            cached = _load_auth_session()
+            if cached:
+                client = _build_client_from_jwt(cached.jwt_token)
+                if client is not None:
+                    return client, cached.username
+        auth = TongjiAuth()
+        auth.login(username=username, password=password)
+        jwt_token = auth.get_jwt_token() or ""
+        if jwt_token:
+            _save_auth_session(AuthSession(username=username, jwt_token=jwt_token))
+        return TongjiClient(auth), username
+
+
+def _account_auth_refresh_lock(username: str):
+    from tongji_backend.media_cache import account_auth_refresh_lock
+
+    return account_auth_refresh_lock(_state_dir(), username)
 
 
 def _check_deps() -> list[str]:
@@ -489,7 +510,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             if query in _course_title(c).lower() or query in _course_teacher(c).lower()
         ]
 
-    if not courses:
+    if not courses and not getattr(args, "json_output", False):
         _print_err("No courses matched the query.")
         return 1
 
@@ -809,6 +830,7 @@ def _prepare_workspace_for_lecture(
     )
     detail = client.get_course_detail(course_id)
     lecture = _find_lecture_info(detail, sub_id)
+    detail = {**detail, 'course_id': course_id}
     return config, prepare_lecture_workspace(config, course_detail=detail, lecture=lecture)
 
 
@@ -851,727 +873,14 @@ def _collect_materials(args: argparse.Namespace) -> list[MaterialInput]:
     return materials
 
 
-def _write_lecture_manifest_from_outputs(
-    *,
-    workspace: Any,
-    course_id: str,
-    sub_id: str,
-    lecture_url: str,
-    transcript_output_dir: Path,
-    slide_output_dir: Path,
-    imported_materials: list[dict[str, Any]] | None = None,
-    note_style: str = "standard",
-    slides_regenerated: bool = False,
-) -> None:
-    base = f"{course_id}_{sub_id}"
-    current_agent = _detect_current_agent()
-    existing_manifest: dict[str, Any] = {}
-    if getattr(workspace, "manifest_path", None) and workspace.manifest_path.exists():
-        try:
-            data = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                existing_manifest = data
-        except Exception:
-            existing_manifest = {}
-    meta_path = transcript_output_dir / f"{base}.json"
-    meta = {}
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            meta = {}
-
-    artifacts = dict(existing_manifest["artifacts"]) if isinstance(existing_manifest.get("artifacts"), dict) else {}
-    artifacts.update({
-        "transcript_txt": str(transcript_output_dir / f"{base}.txt"),
-        "subtitle_srt": str(transcript_output_dir / f"{base}.srt"),
-        "transcript_meta": str(meta_path),
-    })
-    artifacts.setdefault("slides_dir", str(slide_output_dir))
-    artifacts.setdefault("slide_index", str(slide_output_dir / "index.json"))
-    if slides_regenerated:
-        artifacts.update(slides_dir=str(slide_output_dir), slide_index=str(slide_output_dir / "index.json"))
-    artifacts.setdefault("timeline_txt", str(transcript_output_dir / f"{base}_timeline.txt"))
-    merged_agents = _merge_agent_sequence(existing_manifest.get("agents") or existing_manifest.get("agent"), current_agent)
-    merged_materials = _merge_material_entries(existing_manifest.get("materials"), imported_materials)
-    manifest = {**existing_manifest,
-        "course_id": course_id,
-        "sub_id": sub_id,
-        "course_title": workspace.course_title,
-        "session_title": workspace.session_title,
-        "agent": current_agent,
-        "agents": merged_agents or [current_agent],
-        "lecture_url": lecture_url or existing_manifest.get("lecture_url", ""),
-        "video_url": meta.get("video_url", existing_manifest.get("video_url", "")),
-        "base_name": base,
-        "generated_at": _now_iso(),
-        "duration_seconds": int(meta.get("duration_seconds") or existing_manifest.get("duration_seconds") or 0),
-        "subtitle_word_count": int(meta.get("word_count") or meta.get("subtitle_word_count") or existing_manifest.get("subtitle_word_count") or 0),
-        "note_style": note_style or existing_manifest.get("note_style") or "standard",
-        "artifacts": artifacts,
-        "materials": merged_materials,
-    }
-    dur = manifest["duration_seconds"]
-    manifest.pop("duration_warning", None)
-    if 0 < dur < 3600:
-        manifest["duration_warning"] = True
-    write_manifest(workspace, manifest)
-
-
-def _resolve_course_sub(
-    client: TongjiClient,
-    *,
-    lecture_url: str,
-    course_id: str,
-    sub_id: str,
-    lecture_limit: int,
-    tag: str,
-) -> tuple[str, str] | None:
-    course_id = (course_id or "").strip()
-    sub_id = (sub_id or "").strip()
-
-    if lecture_url:
-        parsed_course_id, parsed_sub_id = _extract_ids_from_url(lecture_url)
-        course_id = course_id or (parsed_course_id or "")
-        sub_id = sub_id or (parsed_sub_id or "")
-
-    if not course_id:
-        last = _load_last_course_id()
-        if last:
-            print(f"[{tag}] Using last selected course_id from state: {last}")
-            course_id = last
-
-    if not course_id:
-        _print_err("Missing course_id. Provide --course-id or --lecture-url that contains it.")
-        return None
-
-    if not sub_id:
-        try:
-            sub_id, _ = _choose_lecture_from_course(client, course_id, limit=lecture_limit)
-        except Exception as e:
-            _print_err(str(e))
-            return None
-    return course_id, sub_id
-
-
-def _saved_transcript_ready(out_dir: Path, course_id: str, sub_id: str, username: str) -> bool:
-    base = f"{course_id}_{sub_id}"
-    try:
-        meta = json.loads((out_dir / f"{base}.json").read_text(encoding="utf-8"))
-        if not isinstance(meta, dict) or str(meta.get("course_id")) != course_id or str(meta.get("sub_id")) != sub_id:
-            return False
-        if not username or meta.get("user") != username:
-            return False
-        text = out_dir / f"{base}.txt"
-        if not text.is_file() or text.stat().st_size == 0:
-            return False
-        artifacts = meta.get("artifacts") or {}
-        if not isinstance(artifacts, dict):
-            return False
-        subtitle = out_dir / f"{base}.srt"
-        if artifacts.get("subtitle_srt") and (not subtitle.is_file() or subtitle.stat().st_size == 0):
-            return False
-        hashes = meta.get("artifact_sha256")
-        if meta.get("complete") is True:
-            if not isinstance(hashes, dict) or hashes.get("transcript_txt") != hashlib.sha256(text.read_bytes()).hexdigest():
-                return False
-            return not artifacts.get("subtitle_srt") or hashes.get("subtitle_srt") == hashlib.sha256(subtitle.read_bytes()).hexdigest()
-        # Older upstream results have no commit hashes. Their ASR segments
-        # still let us validate the complete text and timestamps exactly.
-        utterances = meta.get("utterances")
-        if not isinstance(utterances,list) or not utterances or any(not isinstance(u,dict) or not isinstance(u.get("transcript"),str) for u in utterances):
-            return False
-        if text.read_text(encoding="utf-8").strip() != " ".join(u["transcript"] for u in utterances).strip():
-            return False
-        if artifacts.get("subtitle_srt"):
-            from tongji_backend.transcriber import _format_srt_time
-            expected = "\n".join(f"{i}\n{_format_srt_time(u.get('start_time',0))} --> {_format_srt_time(u.get('end_time',0))}\n{u['transcript'].strip()}\n" for i,u in enumerate(utterances,1) if u['transcript'].strip())
-            return subtitle.read_text(encoding="utf-8").strip() == expected.strip()
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
-
-
-def _transcript_audio_cache(username: str, course_id: str, sub_id: str) -> Path:
-    identity = json.dumps([username,course_id,sub_id],ensure_ascii=False)
-    cache_dir = _state_dir()/"media"/hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    if not cache_dir.resolve().is_relative_to(_state_dir().resolve()):
-        raise ValueError("音频缓存路径必须位于本机状态目录内")
-    for name in ('audio.mp3','audio.part.mp3','video_raw.tmp','video_raw.tmp.part','job.lock'):
-        if not (cache_dir/name).resolve().is_relative_to(cache_dir.resolve()):
-            raise ValueError("音频缓存包含外部文件链接")
-    return cache_dir/"audio.mp3"
-
-
-def _run_transcript_job(*, client: TongjiClient, username: str, course_id: str, sub_id: str,
-                        lecture_url: str, output_dir: str, tag: str = "Transcript", force_transcribe: bool = False) -> int:
+def _write_lecture_manifest_from_outputs(**kwargs: Any) -> None:
+    workspace = kwargs["workspace"]
     from tongji_backend.media_cache import lecture_lock
-    if not re.fullmatch(r"[A-Za-z0-9_-]+",course_id) or not re.fullmatch(r"[A-Za-z0-9_-]+",sub_id):
-        raise ValueError("课程和课次标识格式无效")
-    cache = _transcript_audio_cache(username,course_id,sub_id)
-    output_identity = json.dumps([str(_output_dir(output_dir).resolve()),course_id,sub_id],ensure_ascii=False)
-    results_dir = _state_dir()/"transcript_locks"/hashlib.sha256(output_identity.encode("utf-8")).hexdigest()
-    if not results_dir.resolve().is_relative_to(_state_dir().resolve()):
-        raise ValueError("字幕写入锁必须位于本机状态目录内")
-    # Output identity is independent of account; media stays account-scoped.
-    with lecture_lock(results_dir/"job.lock"), lecture_lock(cache.parent/"job.lock"):
-        return _run_transcript_job_locked(client=client,username=username,course_id=course_id,sub_id=sub_id,
-            lecture_url=lecture_url,output_dir=output_dir,tag=tag,force_transcribe=force_transcribe)
+    with lecture_lock(workspace.raw_root / ".manifest.lock"):
+        _write_lecture_manifest_from_outputs_unlocked(**kwargs)
 
 
-def _run_transcript_job_locked(
-    *,
-    client: TongjiClient,
-    username: str,
-    course_id: str,
-    sub_id: str,
-    lecture_url: str,
-    output_dir: str,
-    tag: str = "Transcript",
-    force_transcribe: bool = False,
-) -> int:
-    from tongji_backend.transcriber import NoAudioStreamError, Transcriber, TranscriptionError
-    from tongji_backend.media_tools import MediaToolError
-    emit_progress("transcript", "prepare")
-    out_dir = _output_dir(output_dir)
-    if not force_transcribe and _saved_transcript_ready(out_dir, course_id, sub_id, username):
-        print(f"[{tag}] Reusing existing TXT/SRT; skipping video download and ASR.")
-        emit_progress("transcript", "reuse_transcript")
-        return 0
-
-    print(f"[{tag}] Logged in as: {username or '(unknown)'}")
-    print(f"[{tag}] course_id={course_id} sub_id={sub_id}")
-    video_url = client.get_video_url(course_id, sub_id)
-    if not video_url:
-        _print_err("Failed to resolve video URL. The lecture may not have playback enabled.")
-        return 1
-
-    stream_url, http_headers = client.get_stream_params(video_url)
-    transcriber = Transcriber()
-
-    try:
-        cache = _transcript_audio_cache(username,course_id,sub_id)
-        cache_dir = cache.parent
-        if force_transcribe:
-            for path in (cache, cache_dir / "video_raw.tmp"):
-                if not path.resolve().is_relative_to(cache_dir.resolve()):
-                    raise ValueError("音频缓存包含外部文件链接")
-                path.unlink(missing_ok=True)
-        transcript, srt_content, utterances = transcriber.transcribe_url(
-            stream_url, http_headers=http_headers, audio_cache_path=cache
-        )
-    except NoAudioStreamError as e:
-        _print_err(f"No audio stream: {e}")
-        return 1
-    except MediaToolError as e:
-        _print_err(f"音频工具不可用，已停止转写：{e}")
-        return 2
-    except TranscriptionError as e:
-        _print_err(f"Transcription failed: {e}")
-        return 1
-    except Exception as e:
-        _print_err(f"Unexpected error: {type(e).__name__}: {e}")
-        return 1
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    base = f"{course_id}_{sub_id}"
-    txt_path = out_dir / f"{base}.txt"
-    srt_path = out_dir / f"{base}.srt"
-    meta_path = out_dir / f"{base}.json"
-
-    # Compute duration_seconds from utterance end_time (milliseconds)
-    duration_seconds = 0
-    if utterances:
-        max_end = max(u.get("end_time", 0) for u in utterances)
-        duration_seconds = max_end // 1000
-
-    emit_progress("transcript", "write")
-    # The final metadata is the commit marker: interruption cannot leave
-    # mixed old/new subtitle files looking like a completed result.
-    meta_path.unlink(missing_ok=True)
-    txt_staging = txt_path.with_suffix(".txt.part")
-    txt_staging.write_text(transcript.strip() + "\n", encoding="utf-8")
-    os.replace(txt_staging,txt_path)
-    if srt_content:
-        srt_staging = srt_path.with_suffix(".srt.part")
-        srt_staging.write_text(srt_content.strip() + "\n", encoding="utf-8")
-        os.replace(srt_staging,srt_path)
-    else:
-        srt_path.unlink(missing_ok=True)
-    meta_staging = meta_path.with_suffix(".json.part")
-    meta_staging.write_text(
-        json.dumps(
-            {
-                "course_id": course_id,
-                "sub_id": sub_id,
-                "lecture_url": lecture_url or "",
-                "video_url": video_url,
-                "generated_at": _now_iso(),
-                "user": username or "",
-                "complete": True,
-                "artifact_sha256": {"transcript_txt": hashlib.sha256(txt_path.read_bytes()).hexdigest(),
-                                    "subtitle_srt": hashlib.sha256(srt_path.read_bytes()).hexdigest() if srt_content else ""},
-                "duration_seconds": duration_seconds,
-                "artifacts": {
-                    "transcript_txt": str(txt_path),
-                    "subtitle_srt": str(srt_path) if srt_content else "",
-                },
-                "utterances": utterances or [],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    os.replace(meta_staging,meta_path)
-
-    print(f"[{tag}] Done. Files written:")
-    emit_progress("transcript", "done")
-    print(f"  - {txt_path}")
-    if srt_content:
-        print(f"  - {srt_path}")
-    print(f"  - {meta_path}")
-    return 0
-
-
-def _download_one_slide(
-    client: TongjiClient,
-    item: dict[str, Any],
-    out_dir: Path,
-    index: int,
-    timeout: int,
-    retries: int,
-) -> tuple[dict[str, Any], str | None]:
-    created_sec = int(item.get("created_sec") or 0)
-    image_url = str(item.get("image_url") or "").strip()
-    if not image_url:
-        return item, "missing image_url"
-
-    stamp = _format_hms(created_sec)
-    ext = _guess_ext_from_url(image_url)
-    filename = f"{index:04d}_t{stamp}_s{created_sec:06d}{ext}"
-    path = out_dir / _safe_filename_part(filename)
-
-    last_err = ""
-    for attempt in range(1, max(1, retries) + 1):
-        try:
-            resp = client.session.get(image_url, timeout=timeout)
-            if resp.status_code == 200 and resp.content:
-                path.write_bytes(resp.content)
-                item["filename"] = path.name
-                item["filepath"] = str(path)
-                item["downloaded_at"] = _now_iso()
-                item["bytes"] = len(resp.content)
-                return item, None
-
-            last_err = f"http {resp.status_code}"
-            if resp.status_code in (429, 500, 502, 503, 504):
-                time.sleep(0.5 * attempt)
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            time.sleep(0.5 * attempt)
-
-    return item, last_err or "download failed"
-
-
-def _run_slide_job(
-    *,
-    client: TongjiClient,
-    username: str,
-    course_id: str,
-    sub_id: str,
-    lecture_url: str,
-    output_dir: str,
-    per_page: int,
-    max_pages: int,
-    max_items: int,
-    concurrency: int,
-    retries: int,
-    timeout: int,
-    tag: str = "Slide",
-) -> int:
-    print(f"[{tag}] Logged in as: {username or '(unknown)'}")
-    emit_progress("slides", "prepare")
-    print(f"[{tag}] course_id={course_id} sub_id={sub_id}")
-    try:
-        snapshots = client.get_ppt_snapshots(
-            course_id,
-            sub_id,
-            per_page=max(1, int(per_page)),
-            max_pages=max(1, int(max_pages)),
-        )
-    except Exception as e:
-        _print_err(f"Failed to list slide snapshots: {e}")
-        return 1
-
-    if not snapshots:
-        _print_err("No slide snapshots found for this lecture.")
-        return 1
-
-    if max_items and max_items > 0:
-        snapshots = snapshots[: max_items]
-
-    out_dir = (
-        Path(output_dir).expanduser().resolve()
-        if output_dir
-        else (Path.cwd() / "tongji-output" / f"slide_{course_id}_{sub_id}").resolve()
-    )
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    concurrency = max(1, min(int(concurrency), 16))
-    retries = max(1, min(int(retries), 8))
-    timeout = max(5, int(timeout))
-
-    print(
-        f"[{tag}] Found {len(snapshots)} snapshots. Downloading with "
-        f"concurrency={concurrency}, retries={retries}, timeout={timeout}s ..."
-    )
-
-    results: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = []
-    emit_progress("slides", "download", completed=0, total=len(snapshots), unit="张")
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        fut_map = {
-            executor.submit(
-                _download_one_slide,
-                client,
-                item,
-                out_dir,
-                idx,
-                timeout,
-                retries,
-            ): item
-            for idx, item in enumerate(snapshots, 1)
-        }
-
-        done_count = 0
-        total = len(fut_map)
-        for fut in concurrent.futures.as_completed(fut_map):
-            item, err = fut.result()
-            done_count += 1
-            if err:
-                failures.append({"item": item, "error": err})
-            else:
-                results.append(item)
-            emit_progress("slides", "download", completed=done_count, total=total, failed=len(failures), unit="张")
-            if done_count % 10 == 0 or done_count == total:
-                print(f"[{tag}] Progress: {done_count}/{total}")
-
-    results.sort(key=lambda x: int(x.get("created_sec") or 0))
-
-    meta_path = out_dir / "index.json"
-    meta = {
-        "course_id": course_id,
-        "sub_id": sub_id,
-        "lecture_url": lecture_url or "",
-        "generated_at": _now_iso(),
-        "user": username or "",
-        "download": {
-            "requested": len(snapshots),
-            "succeeded": len(results),
-            "failed": len(failures),
-            "concurrency": concurrency,
-            "retries": retries,
-            "timeout_seconds": timeout,
-        },
-        "items": results,
-        "failures": failures,
-    }
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    print(f"[{tag}] Done.")
-    print(f"  - output_dir: {out_dir}")
-    print(f"  - success: {len(results)}")
-    print(f"  - failed: {len(failures)}")
-    print(f"  - index: {meta_path}")
-    if failures:
-        print(f"[{tag}] Some downloads failed. You can re-run with lower --concurrency (e.g. 2) or higher --retries.")
-    return 0 if not failures else 3
-
-
-def _atomic_write_json(path: Path, data: Any) -> None:
-    """Write JSON atomically: write to tmp file then rename."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp.json")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def _create_batch_state(course_id: str, lectures: list[dict[str, Any]]) -> dict[str, Any]:
-    now = _now_iso()
-    return {
-        "course_id": course_id,
-        "started_at": now,
-        "updated_at": now,
-        "lectures": [
-            {
-                "sub_id": str(l.get("sub_id", "")),
-                "sub_title": str(l.get("sub_title", "")),
-                "status": "pending",
-                "attempts": 0,
-                "error": None,
-            }
-            for l in lectures
-        ],
-    }
-
-
-def cmd_batch_transcribe(args: argparse.Namespace) -> int:
-    try:
-        client, username = _ensure_authenticated_client(force_login=args.force_login)
-    except Exception as e:
-        _print_err(str(e))
-        return 1
-
-    course_id = (args.course_id or "").strip()
-    if not course_id:
-        _print_err("Missing --course-id")
-        return 2
-
-    print(f"[Batch] Fetching course detail for course_id={course_id} ...")
-    try:
-        detail = client.get_course_detail(course_id)
-    except Exception as e:
-        _print_err(f"Failed to get course detail: {e}")
-        return 1
-
-    lectures_raw = detail.get("lectures") or []
-    lectures = [l for l in lectures_raw if l.get("has_playback") is True]
-    if not lectures:
-        _print_err("No playable lectures found for this course.")
-        return 1
-
-    print(f"[Batch] Found {len(lectures)} lecture(s) with playback enabled.")
-
-    try:
-        config = ensure_workspace_config(
-            workspace_root=args.workspace_root or None,
-            owner_name=args.owner_name or None,
-            site_name=args.site_name or None,
-            interactive=not args.no_workspace_prompt,
-        )
-    except Exception as e:
-        _print_err(f"Workspace config failed: {e}")
-        return 1
-
-    batch_state_path = checkpoint_path(config.workspace_root, course_id)
-    legacy_state_path = config.workspace_root / "batch_state.json"
-    if not batch_state_path.exists() and legacy_state_path.is_file():
-        try:
-            legacy = json.loads(legacy_state_path.read_text(encoding="utf-8"))
-            if isinstance(legacy, dict) and legacy.get("course_id") == course_id:
-                _atomic_write_json(batch_state_path, legacy)
-        except (OSError, ValueError):
-            pass
-    max_retries = max(1, int(args.max_retries))
-
-    # Load or create batch state (interrupt-safe resume)
-    if batch_state_path.exists():
-        try:
-            state = json.loads(batch_state_path.read_text(encoding="utf-8"))
-            if state.get("course_id") != course_id:
-                print(f"[Batch] Existing state is for course '{state.get('course_id')}', starting fresh.")
-                state = _create_batch_state(course_id, lectures)
-            else:
-                # Reset any in_progress items back to pending
-                for item in state.get("lectures", []):
-                    if item.get("status") == "in_progress":
-                        item["status"] = "pending"
-                done = sum(1 for l in state.get("lectures", []) if l.get("status") == "done")
-                print(f"[Batch] Resuming from existing batch_state.json ({done}/{len(lectures)} done)")
-        except Exception:
-            print("[Batch] Could not read batch_state.json, starting fresh.")
-            state = _create_batch_state(course_id, lectures)
-    else:
-        state = _create_batch_state(course_id, lectures)
-        _atomic_write_json(batch_state_path, state)
-        print(f"[Batch] Created batch_state.json at {batch_state_path}")
-
-    # Ensure the lectures list in state covers all current lectures
-    state_sub_ids = {l["sub_id"] for l in state.get("lectures", [])}
-    for lec in lectures:
-        sid = str(lec.get("sub_id", ""))
-        if sid not in state_sub_ids:
-            state.setdefault("lectures", []).append({
-                "sub_id": sid,
-                "sub_title": str(lec.get("sub_title", "")),
-                "status": "pending",
-                "attempts": 0,
-                "error": None,
-            })
-
-    def _save_state():
-        state["updated_at"] = _now_iso()
-        _atomic_write_json(batch_state_path, state)
-        _atomic_write_json(legacy_state_path, state)
-        done = sum(item.get("status") == "done" for item in state["lectures"])
-        failed = sum(item.get("status") == "failed" for item in state["lectures"])
-        emit_progress("batch", "recognize", completed=done + failed, total=len(state["lectures"]), failed=failed, unit="节")
-
-    if getattr(args, "retry_failed", False):
-        for item in state["lectures"]:
-            if item.get("status") == "failed":
-                item.update(status="pending", attempts=0, error=None)
-    _save_state()
-
-    cancel_file = os.environ.get("LOOK_TONGJI_BATCH_CANCEL_FILE", "").strip()
-    cancel_path = Path(cancel_file) if cancel_file else None
-
-    try:
-        while True:
-            if cancel_path is not None and cancel_path.exists():
-                print("\n[Batch] Cancel requested. Saving current state...")
-                for item in state.get("lectures", []):
-                    if item.get("status") == "in_progress":
-                        item["status"] = "pending"
-                _save_state()
-                print(f"[Batch] State saved to {batch_state_path}. Re-run to continue.")
-                return 130
-
-            # NOTE: only 'pending' is taken here. An item is set back to 'pending'
-            # while it still has retries left (see below), so 'failed' means
-            # retries are exhausted and must NOT be re-queued.
-            pending = [l for l in state.get("lectures", []) if l["status"] == "pending"]
-            if not pending:
-                break
-
-            item = pending[0]
-            sub_id = item["sub_id"]
-            sub_title = item["sub_title"] or sub_id
-            done = sum(1 for l in state["lectures"] if l["status"] == "done")
-            total = len(state["lectures"])
-
-            print(f"[Batch] [{done + 1}/{total}] Processing: {sub_title} ({sub_id})")
-
-            item["status"] = "in_progress"
-            item["attempts"] = int(item.get("attempts", 0)) + 1
-            _save_state()
-
-            output_dir_str = args.output_dir
-            workspace = None
-            if not output_dir_str:
-                try:
-                    _config, workspace = _prepare_workspace_for_lecture(
-                        client, args, course_id=course_id, sub_id=sub_id,
-                    )
-                    output_dir_str = str(workspace.raw_root)
-                except Exception as e:
-                    if item["attempts"] >= max_retries:
-                        item["status"] = "failed"
-                        item["error"] = (
-                            f"Workspace setup failed after {item['attempts']} attempt(s): {e}"
-                        )
-                    else:
-                        item["status"] = "pending"
-                        item["error"] = (
-                            f"Workspace setup attempt {item['attempts']}/{max_retries} failed: {e}"
-                        )
-                    _save_state()
-                    continue
-
-            result = _run_transcript_job(
-                client=client,
-                username=username,
-                course_id=course_id,
-                sub_id=sub_id,
-                lecture_url="",
-                output_dir=output_dir_str,
-                tag="Batch",
-                force_transcribe=getattr(args, "force_transcribe", False),
-            )
-            if result == 0 and workspace is not None:
-                try:
-                    _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
-                        lecture_url="", transcript_output_dir=Path(output_dir_str), slide_output_dir=workspace.raw_slides_dir,
-                        note_style="")
-                except Exception as exc:
-                    _print_err(f"Failed to register transcript: {exc}")
-                    result = 1
-
-            if result == 0:
-                item["status"] = "done"
-                item["error"] = None
-            else:
-                if item["attempts"] >= max_retries:
-                    item["status"] = "failed"
-                    item["error"] = f"Failed after {item['attempts']} attempt(s), last code={result}"
-                else:
-                    item["status"] = "pending"
-                    item["error"] = f"Attempt {item['attempts']}/{max_retries} failed"
-
-            _save_state()
-
-    except KeyboardInterrupt:
-        print("\n[Batch] Interrupted by user. Saving current state...")
-        for item in state.get("lectures", []):
-            if item["status"] == "in_progress":
-                item["status"] = "pending"
-        _save_state()
-        print(f"[Batch] State saved to {batch_state_path}. Re-run to continue.")
-        return 130
-
-    # Summary
-    done_count = sum(1 for l in state["lectures"] if l["status"] == "done")
-    failed_count = sum(1 for l in state["lectures"] if l["status"] == "failed")
-    print(f"[Batch] Summary: {done_count} done, {failed_count} failed")
-    if failed_count > 0:
-        print("[Batch] Failed lectures:")
-        for l in state["lectures"]:
-            if l["status"] == "failed":
-                print(f"  - {l['sub_title']} ({l['sub_id']}): {l.get('error', 'unknown')}")
-    return 0 if failed_count == 0 else 3
-
-
-def cmd_transcript(args: argparse.Namespace) -> int:
-    try:
-        client, username = _ensure_authenticated_client(force_login=args.force_login)
-    except Exception as e:
-        _print_err(str(e))
-        return 1
-    resolved = _resolve_course_sub(
-        client,
-        lecture_url=args.lecture_url,
-        course_id=args.course_id,
-        sub_id=args.sub_id,
-        lecture_limit=args.lecture_limit,
-        tag="Transcript",
-    )
-    if not resolved:
-        return 2
-    course_id, sub_id = resolved
-    workspace = None
-    if not args.output_dir or args.slide:
-        try:
-            _config, workspace = _prepare_workspace_for_lecture(client, args, course_id=course_id, sub_id=sub_id)
-            if not args.output_dir:
-                args.output_dir = str(workspace.raw_root)
-        except Exception as e:
-            _print_err(f"Workspace setup failed: {e}")
-            return 1
-
-    if args.slide:
-        slide_output_dir = workspace.raw_slides_dir
-        jwt_token = client.auth.get_jwt_token() or ""
-        t_client = _build_client_from_jwt(jwt_token) if jwt_token else client
-        s_client = _build_client_from_jwt(jwt_token) if jwt_token else client
-        t_client = t_client or client
-        s_client = s_client or client
-
-        print("[Transcript] Running transcript and slide jobs in parallel...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            fut_transcript = executor.submit(
-                _run_transcript_job,
-                client=t_client,
-                username=username,
-                course_id=course_id,
-                sub_id=sub_id,
-                lecture_url=args.lecture_url,
-                output_dir=args.output_dir,
-                tag="Transcript",
-                force_transcribe=getattr(args, "force_transcribe", False),
+def _write_lecture…7483 tokens truncated…_transcribe", False),
             )
             fut_slide = executor.submit(
                 _run_slide_job,
@@ -1599,7 +908,8 @@ def cmd_transcript(args: argparse.Namespace) -> int:
         if workspace is not None:
             _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
                 lecture_url=args.lecture_url, transcript_output_dir=Path(args.output_dir),
-                slide_output_dir=workspace.raw_slides_dir, note_style="", slides_regenerated=True)
+                slide_output_dir=workspace.raw_slides_dir, note_style="", slides_regenerated=True,
+                defer_site_build=getattr(args, "defer_site_build", False))
         return 0
 
     result = _run_transcript_job(
@@ -1615,7 +925,8 @@ def cmd_transcript(args: argparse.Namespace) -> int:
     if result == 0 and workspace is not None:
         _write_lecture_manifest_from_outputs(workspace=workspace, course_id=course_id, sub_id=sub_id,
             lecture_url=args.lecture_url, transcript_output_dir=Path(args.output_dir),
-            slide_output_dir=workspace.raw_slides_dir, note_style="")
+            slide_output_dir=workspace.raw_slides_dir, note_style="",
+            defer_site_build=getattr(args, "defer_site_build", False))
     return result
 
 
@@ -1662,24 +973,26 @@ def cmd_slide(args: argparse.Namespace) -> int:
     if result == 0 and workspace is not None:
         # A slide-only lecture has no transcript filename from which the GUI
         # can infer IDs. Record identity without replacing existing artifacts.
-        manifest = {}
-        if workspace.manifest_path.is_file():
-            try:
-                saved = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
-                manifest = saved if isinstance(saved, dict) else {}
-            except (OSError, ValueError):
-                pass
-        manifest.update({"course_id": course_id, "sub_id": sub_id,
-                         "course_title": workspace.course_title, "session_title": workspace.session_title})
-        manifest.setdefault("base_name", f"{course_id}_{sub_id}")
-        manifest.setdefault("generated_at", _now_iso())
-        manifest.setdefault("lecture_url", args.lecture_url or "")
-        recorded = manifest.get("artifacts")
-        recorded = dict(recorded) if isinstance(recorded, dict) else {}
-        recorded.update({"slides_dir": str(Path(args.output_dir).resolve()),
-                         "slide_index": str(Path(args.output_dir).resolve() / "index.json")})
-        manifest["artifacts"] = recorded
-        write_manifest(workspace, manifest)
+        from tongji_backend.media_cache import lecture_lock
+        with lecture_lock(workspace.raw_root / ".manifest.lock"):
+            manifest = {}
+            if workspace.manifest_path.is_file():
+                try:
+                    saved = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
+                    manifest = saved if isinstance(saved, dict) else {}
+                except (OSError, ValueError):
+                    pass
+            manifest.update({"course_id": course_id, "sub_id": sub_id,
+                             "course_title": workspace.course_title, "session_title": workspace.session_title})
+            manifest.setdefault("base_name", f"{course_id}_{sub_id}")
+            manifest.setdefault("generated_at", _now_iso())
+            manifest.setdefault("lecture_url", args.lecture_url or "")
+            recorded = manifest.get("artifacts")
+            recorded = dict(recorded) if isinstance(recorded, dict) else {}
+            recorded.update({"slides_dir": str(Path(args.output_dir).resolve()),
+                             "slide_index": str(Path(args.output_dir).resolve() / "index.json")})
+            manifest["artifacts"] = recorded
+            write_manifest(workspace, manifest, defer_site_build=getattr(args, "defer_site_build", False))
     return result
 
 
@@ -1777,6 +1090,7 @@ def cmd_note(args: argparse.Namespace) -> int:
         imported_materials=imported_materials,
         note_style=args.note_style,
         slides_regenerated=not args.no_slide,
+        defer_site_build=getattr(args, "defer_site_build", False),
     )
 
     # Duration check: warn if < 1 hour (non-blocking)
@@ -1789,6 +1103,13 @@ def cmd_note(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
+    return _build_workspace_if_requested(config, defer=getattr(args, "defer_site_build", False))
+
+
+def _build_workspace_if_requested(config: WorkspaceConfig, *, defer: bool) -> int:
+    if defer:
+        print("[Wiki] Site build deferred; workspace index will be refreshed by the build workflow.")
+        return 0
     try:
         site_dir = build_workspace_wiki(config)
         print(f"[Wiki] Built course site: {site_dir}")
@@ -2004,6 +1325,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_transcript.add_argument("--owner-name", default="", help="Owner name shown in the course wiki")
     p_transcript.add_argument("--site-name", default="", help="Course wiki site name")
     p_transcript.add_argument("--no-workspace-prompt", action="store_true", help="Do not prompt for workspace config")
+    p_transcript.add_argument("--defer-site-build", action="store_true", help="Defer shared workspace indexing and site build")
     p_transcript.add_argument("--force-login", action="store_true", help="Ignore cached JWT and login again")
     p_transcript.add_argument("--force-transcribe", action="store_true", help="Ignore saved subtitles and audio; download and transcribe again")
     p_transcript.add_argument("--slide", action="store_true", help="Also download slides in parallel with transcription")
@@ -2042,6 +1364,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_slide.add_argument("--owner-name", default="", help="Owner name shown in the course wiki")
     p_slide.add_argument("--site-name", default="", help="Course wiki site name")
     p_slide.add_argument("--no-workspace-prompt", action="store_true", help="Do not prompt for workspace config")
+    p_slide.add_argument("--defer-site-build", action="store_true", help="Defer shared workspace indexing and site build")
     p_slide.add_argument("--per-page", type=int, default=100, help="search-ppt per_page parameter")
     p_slide.add_argument("--max-pages", type=int, default=20, help="Max pages to request from search-ppt")
     p_slide.add_argument("--max-items", type=int, default=0, help="Download at most N snapshots (0 means all)")
@@ -2068,6 +1391,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_note.add_argument("--material", action="append", default=[], help="Supplementary material as name=path or path")
     p_note.add_argument("--no-material-prompt", action="store_true", help="Do not ask for supplementary materials")
     p_note.add_argument("--no-workspace-prompt", action="store_true", help="Do not prompt for workspace config")
+    p_note.add_argument("--defer-site-build", action="store_true", help="Defer shared workspace indexing and site build")
     p_note.add_argument("--no-slide", action="store_true", help="Skip slide download and run transcript only")
     p_note.add_argument("--per-page", type=int, default=100, help="search-ppt per_page parameter")
     p_note.add_argument("--max-pages", type=int, default=20, help="Max pages to request from search-ppt")

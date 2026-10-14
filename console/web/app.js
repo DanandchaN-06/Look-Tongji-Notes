@@ -22,6 +22,8 @@
     submitting: false,
     agentMetadata: null,
     courseEpoch: 0,
+    courseLoadEpoch: 0,
+    taskCourses: new Map(),
   };
 
   /* ---------------- token + api ---------------- */
@@ -47,7 +49,9 @@
     let data = null;
     try { data = await res.json(); } catch (e) { data = { ok: false, error: '响应不是合法 JSON' }; }
     if (!res.ok || data.ok === false) {
-      throw new Error(data && data.error ? data.error : ('请求失败 (' + res.status + ')'));
+      const message = data && data.error ? data.error : ('请求失败 (' + res.status + ')');
+      const detail = data && typeof data.detail === 'string' ? data.detail.trim() : '';
+      throw new Error(message + (detail ? '\n' + detail : ''));
     }
     return data;
   }
@@ -419,25 +423,38 @@
   /* ---------------- courses ---------------- */
 
   async function loadCourses(options) {
+    const epoch = ++S.courseLoadEpoch;
     options = options && options.agent ? options : {};
     const msg = $('#courseMsg');
     const btn = $('#btnLoadCourses');
     btn.disabled = true;
     msg.textContent = '正在登录并获取课程列表，首次可能需要数十秒…';
+    banner('正在获取课程列表…', 'info');
     try {
-      const query = '/api/courses?query=' + encodeURIComponent(options.agent ? '' : $('#courseQuery').value.trim()) +
-        '&all=' + (options.agent || $('#courseAll').checked ? '1' : '0') + '&force_login=' + ($('#courseForceLogin').checked ? '1' : '0');
+      const keyword = options.agent ? '' : $('#courseQuery').value.trim();
+      const allCourses = options.agent || $('#courseAll').checked || !!keyword;
+      const query = '/api/courses?query=' + encodeURIComponent(keyword) +
+        '&all=' + (allCourses ? '1' : '0') + '&force_login=' + ($('#courseForceLogin').checked ? '1' : '0');
       const data = await api(query);
+      if (epoch !== S.courseLoadEpoch) return;
       S.courses = data.courses || [];
       renderCourses();
       renderAgentTarget();
       renderBatchCourses();
-      msg.textContent = '共 ' + S.courses.length + ' 门课程。';
+      if (S.courses.length) {
+        msg.textContent = '已获取 ' + S.courses.length + ' 门' + (allCourses ? '可访问课程' : '最近访问的课程') + '。';
+        banner(msg.textContent, 'ok');
+      } else {
+        msg.textContent = keyword ? '未找到匹配课程，请清空搜索或核对课程/教师名。' : '当前列表为空，可尝试查看全部可访问课程。';
+        $('#courseList').innerHTML = '<div class="empty">' + esc(msg.textContent) + '</div>';
+        banner(msg.textContent, 'info');
+      }
     } catch (err) {
+      if (epoch !== S.courseLoadEpoch) return;
       msg.textContent = '';
       banner('获取课程失败：' + err.message, 'err');
     } finally {
-      btn.disabled = false;
+      if (epoch === S.courseLoadEpoch) btn.disabled = false;
     }
   }
 
@@ -650,12 +667,38 @@
       const data = await api('/api/tasks');
       S.tasks = data.tasks || [];
       renderTasks();
+      resolveTaskNames();
     } catch (err) { /* silent */ }
   }
 
   function statusText(t) {
     return ({ queued: '排队中', running: '进行中', succeeded: '已完成',
               failed: '失败', cancelled: '已取消' })[t.status] || t.status;
+  }
+
+  function taskTarget(t) {
+    const p = t.params || {};
+    if (!p.course_id) return '资料库整体';
+    const data = S.taskCourses.get(String(p.course_id)) || {};
+    const course = S.courses.find(c => String(c.course_id) === String(p.course_id)) || {};
+    const lecture = (data.lectures || []).find(l => String(l.sub_id) === String(p.sub_id)) || {};
+    const title = p.course_title || data.title || course.title || ('课程 ID ' + p.course_id);
+    const section = p.sub_id ? p.session_title || lecture.sub_title || ('课次 ID ' + p.sub_id) : '整门课程';
+    return title + ' · ' + section + ((p.date || lecture.date) ? ' · ' + (p.date || lecture.date) : '');
+  }
+
+  function resolveTaskNames() {
+    const ids = [...new Set(S.tasks.map(t => String((t.params || {}).course_id || '')).filter(Boolean))];
+    ids.forEach(id => {
+      if (S.taskCourses.has(id)) return;
+      S.taskCourses.set(id, {});
+      api('/api/lectures?course_id=' + encodeURIComponent(id)).then(data => {
+        S.taskCourses.set(id, data);
+        renderTasks();
+        const selected = S.tasks.find(t => t.id === S.currentTaskId);
+        if (selected) renderTaskDetail(selected);
+      }).catch(() => {});
+    });
   }
 
   function renderTasks() {
@@ -666,7 +709,9 @@
       '" data-task="' + esc(t.id) + '"><div class="li-title">' + esc(t.label) +
       ' <span class="pill ' + (t.status === 'succeeded' ? 'pill-ok' :
         (t.status === 'failed' ? 'pill-warn' : 'pill-muted')) + '">' + statusText(t) + '</span></div>' +
-      '<div class="li-meta">' + esc(new Date(t.created_at * 1000).toLocaleTimeString()) +
+      '<div class="li-meta">' + esc(taskTarget(t)) + '</div>' +
+      '<div class="li-meta">' + esc(new Date(t.created_at * 1000).toLocaleString()) +
+      (t.status === 'queued' && t.queue_position ? ' · 队列第 ' + esc(t.queue_position) + ' 个' : '') +
       (t.progress ? ' · ' + esc(t.progress.label) + (t.progress.percent == null ? '' : ' · ' + t.progress.percent + '%') : '') + '</div></button>'
     ).join('');
     $$('#taskList .list-item').forEach((el) => {
@@ -717,7 +762,6 @@
       S.logOffset = data.offset;
       const t = data.task;
       renderTaskDetail(t);
-      $('#taskDetailTitle').textContent = t.label + ' · ' + statusText(t);
       $('#btnCancelTask').hidden = !(t.status === 'running' || t.status === 'queued');
       if (t.status === 'succeeded' || t.status === 'failed' || t.status === 'cancelled') {
         stopPolling();
@@ -756,12 +800,33 @@
   $('#btnIndex').addEventListener('click', () => startTask('index', {}, '建立知识库索引'));
 
   function renderTaskDetail(task) {
+    $('#taskDetailTitle').textContent = task.label + ' · ' + taskTarget(task) + ' · ' + statusText(task);
     window.ConsoleProgress.render(task);
+    const recoverable = ['failed', 'cancelled'].includes(task.status);
+    const retry = $('#btnRetryTask');
+    retry.hidden = !recoverable || !task.params || !task.kind;
+    retry.textContent = task.kind === 'batch' ? '继续批量任务（重试失败项）' : '重试任务（沿用已下载素材）';
+    retry.onclick = async () => {
+      if (S.submitting) return;
+      retry.disabled = true;
+      const params = Object.assign({}, task.params, { force_transcribe: false });
+      if (task.kind === 'batch') params.retry_failed = true;
+      try { await startTask(task.kind, params, task.label); }
+      finally { retry.disabled = false; }
+    };
+    const recovery = $('#taskRecoveryHint');
+    recovery.hidden = !recoverable;
+    const output = (task.error || '') + '\n' + $('#taskLog').textContent;
+    recovery.textContent = /\b(412|403|401)\b.*(?:Client Error|HTTP)|HTTP\s*(412|403|401)|识别服务拒绝/.test(output)
+      ? '云端字幕识别服务拒绝请求。已下载的音频会保留，稍后重试可接着识别；持续被拒绝时，重试不能保证成功。'
+      : /No slide snapshots found/.test(output)
+        ? '该课次没有平台课件截图。可到 Agent 工作台使用已有字幕或补充材料继续；重复下载截图可能仍为空。'
+        : '任务未完成。重试会沿用原课程与课次，并复用有效字幕和缓存音频；批量任务跳过已完成课次。也可进入工作台检查已有素材。';
     $('#btnCancelTask').disabled = !!task.cancel_requested;
     $('#btnCancelTask').textContent = task.cancel_requested ? '正在停止…' : '取消任务';
     const next = $('#btnTaskNext');
-    next.hidden = task.status !== 'succeeded' || !['note', 'slide', 'transcribe', 'add', 'index', 'build', 'batch'].includes(task.kind);
-    next.textContent = ['index', 'build'].includes(task.kind) ? '去资料库查看阅读网页' : '去 Agent 工作台写作';
+    next.hidden = !(task.status === 'succeeded' || recoverable) || !['note', 'slide', 'transcribe', 'add', 'index', 'build', 'batch'].includes(task.kind);
+    next.textContent = ['index', 'build'].includes(task.kind) ? '去资料库查看阅读网页' : recoverable ? '去 Agent 工作台检查素材 / 继续' : '去 Agent 工作台写作';
     next.onclick = async () => {
       if (task.params && task.params.course_id) {
         if (!await selectCourse(task.params.course_id)) return;

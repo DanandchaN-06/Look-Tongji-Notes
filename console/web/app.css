@@ -147,7 +147,7 @@ input:focus, select:focus, textarea:focus {
 .pill-warn { background: var(--warn-soft); color: var(--warn); }
 .pill-muted { background: var(--surface-2); color: var(--text-2); }
 
-.banner { padding: 11px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
+.banner { padding: 11px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .banner.info { background: var(--accent-soft); color: #14417f; }
 .banner.warn { background: var(--warn-soft); color: var(--warn); }
 .banner.err { background: var(--danger-soft); color: var(--danger); }

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 from . import progress
+from .scheduler import ResourceScheduler, ScheduledJob
 
 from .core import (
     REPO_ROOT,
@@ -69,6 +70,11 @@ class Task:
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
     _dropped: int = field(default=0, repr=False)
     _progress: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    _schedule_lane: str = field(default="legacy", repr=False)
+    _lecture_key: str | None = field(default=None, repr=False)
+    _parallelism: int = field(default=1, repr=False)
+    _parallel_group: str | None = field(default=None, repr=False)
+    _schedule_exclusive: bool = field(default=False, repr=False)
 
     def consume_progress(self, line: str) -> bool:
         event = progress.parse_event(line)
@@ -166,6 +172,8 @@ def build_argv(kind: str, params: dict[str, Any]) -> list[str]:
         argv.append("--force-login")
     if kind in ("transcribe", "note", "batch") and params.get("force_transcribe"):
         argv.append("--force-transcribe")
+    if kind in ("transcribe", "slide", "note") and params.get("defer_site_build"):
+        argv.append("--defer-site-build")
     if kind in ("slide", "note"):
         for key, flag, low, high in (("limit", "--max-items", 0, 5000), ("concurrency", "--concurrency", 1, 16),
                                       ("retries", "--retries", 1, 8), ("timeout", "--timeout", 5, 300)):
@@ -230,15 +238,19 @@ class TaskManager:
         self._order: deque[str] = deque()
         self._lock = threading.Lock()
         self._runtimes: dict[str, Path] = {}
-        self._queue_condition = threading.Condition()
-        self._pending_jobs: deque[str] = deque()
-        self._active_job: str | None = None
-        self._threads: dict[str, threading.Thread] = {}
+        self._scheduler = ResourceScheduler(workers=4)
         self._closing = threading.Event()
 
     # -- lifecycle ---------------------------------------------------------
 
-    def start(self, kind: str, params: dict[str, Any]) -> Task:
+    def start(
+        self,
+        kind: str,
+        params: dict[str, Any],
+        *,
+        account_id: str | None = None,
+        parallelism: int = 1,
+    ) -> Task:
         if self._closing.is_set():
             raise ValueError("控制台正在停止，请重新启动后再创建任务")
         if kind == "serve":
@@ -250,9 +262,19 @@ class TaskManager:
             kind=kind,
             params={k: v for k, v in params.items() if k in {
                 "course_id", "sub_id", "note_style", "materials", "no_slide",
-                "force_login", "force_transcribe", "max_retries", "retry_failed", "limit", "concurrency", "retries", "timeout", "format", "output", "port"}},
+                "force_login", "force_transcribe", "defer_site_build", "max_retries", "retry_failed", "limit", "concurrency", "retries", "timeout", "format", "output", "port"}},
             argv=argv,
         )
+        task._parallelism = max(1, min(4, int(parallelism)))
+        if account_id is not None and kind not in LONG_RUNNING:
+            task._schedule_lane = {"transcribe": "asr", "batch": "asr", "note": "write", "slide": "download"}.get(kind, "write")
+            course_id, sub_id = _s(params, "course_id"), _s(params, "sub_id")
+            task._lecture_key = f"{account_id}\0{course_id}\0{sub_id}" if course_id and sub_id else None
+            task._parallel_group = "course-workflows"
+        elif kind == "serve":
+            task._schedule_lane = "preview"
+        else:
+            task._schedule_exclusive = True
         env_extra: dict[str, str] = {}
         cancel_path = None
         if kind == "batch":
@@ -262,62 +284,52 @@ class TaskManager:
                 cancel_path.unlink()
             env_extra["LOOK_TONGJI_BATCH_CANCEL_FILE"] = str(cancel_path)
 
-        thread = threading.Thread(
-            target=self._run, args=(task, env_extra), daemon=True, name=f"task-{task.id}"
-        )
         with self._lock:
             if self._closing.is_set():
                 raise ValueError("控制台正在停止")
             self._tasks[task.id] = task
             self._order.append(task.id)
-            self._threads[task.id] = thread
             if cancel_path is not None:
                 self._runtimes[task.id] = cancel_path
-            if kind not in LONG_RUNNING:
-                with self._queue_condition:
-                    self._pending_jobs.append(task.id)
-                    self._queue_condition.notify_all()
             try:
-                thread.start()
-            except RuntimeError as exc:
+                self._scheduler.submit(ScheduledJob(
+                    id=task.id,
+                    lane=task._schedule_lane,
+                    lecture_key=task._lecture_key,
+                    parallelism=task._parallelism,
+                    parallel_group=task._parallel_group,
+                    exclusive=task._schedule_exclusive,
+                    callback=lambda: self._run(task, env_extra),
+                    on_cancel=lambda: self._mark_queued_cancelled(task),
+                    on_error=lambda error: self._mark_runner_error(task, error),
+                ))
+            except Exception as exc:
                 self._tasks.pop(task.id, None)
                 self._order.remove(task.id)
-                self._threads.pop(task.id, None)
                 self.cleanup(task.id)
-                with self._queue_condition:
-                    if task.id in self._pending_jobs:
-                        self._pending_jobs.remove(task.id)
-                    self._queue_condition.notify_all()
-                raise ValueError("无法启动后台任务线程") from exc
+                raise ValueError("无法将任务加入资源调度队列") from exc
         return task
 
     def _run(self, task: Task, env_extra: dict[str, str]) -> None:
-        # Workspace writes are serialized; preview servers use their own lane.
-        acquired = False
-        try:
-            if task.kind not in LONG_RUNNING:
-                with self._queue_condition:
-                    while (not task._cancel.is_set() and
-                           (self._active_job is not None or self._pending_jobs[0] != task.id)):
-                        self._queue_condition.wait(timeout=.2)
-                    self._pending_jobs.remove(task.id)
-                    if not task._cancel.is_set():
-                        self._active_job = task.id
-                        acquired = True
-                    self._queue_condition.notify_all()
-            if task._cancel.is_set():
-                task.status = "cancelled"
-                task.returncode = 130
-                task.ended_at = time.time()
-                task.append("[console] 排队任务已取消")
-                self.cleanup(task.id)
-                return
-            self._execute(task, env_extra)
-        finally:
-            if acquired:
-                with self._queue_condition:
-                    self._active_job = None
-                    self._queue_condition.notify_all()
+        if task._cancel.is_set():
+            self._mark_queued_cancelled(task)
+            return
+        self._execute(task, env_extra)
+
+    def _mark_queued_cancelled(self, task: Task) -> None:
+        task.status = "cancelled"
+        task.returncode = 130
+        task.ended_at = time.time()
+        task.append("[console] 排队任务已取消")
+        self.cleanup(task.id)
+
+    def _mark_runner_error(self, task: Task, error: Exception) -> None:
+        task.status = "failed"
+        task.error = f"任务执行失败: {error}"
+        task.returncode = -1
+        task.ended_at = time.time()
+        task.append(task.error)
+        self.cleanup(task.id)
 
     def _execute(self, task: Task, env_extra: dict[str, str]) -> None:
         task.status = "running"
@@ -416,8 +428,7 @@ class TaskManager:
     def list(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
             ids = list(self._order)[-limit:]
-            with self._queue_condition:
-                positions = {task_id: index + 1 for index, task_id in enumerate(self._pending_jobs)}
+            positions = self._scheduler.queue_positions()
             return [{**self._tasks[i].snapshot(), "queue_position": positions.get(i)} for i in reversed(ids) if i in self._tasks]
 
     # -- cancel ------------------------------------------------------------
@@ -430,8 +441,8 @@ class TaskManager:
             return {"id": task_id, "status": task.status, "message": "任务已结束"}
 
         task._cancel.set()
-        with self._queue_condition:
-            self._queue_condition.notify_all()
+        if task.status == "queued" and self._scheduler.cancel(task.id):
+            return {"id": task_id, "status": "cancelled", "message": "排队任务已取消"}
 
         # Batch transcription polls this flag between lectures, which lets it
         # persist `batch_state.json` and stay resumable.
@@ -469,6 +480,4 @@ class TaskManager:
         for task in tasks:
             if task._proc is not None and task._proc.poll() is None:
                 _kill_tree(task._proc)
-        deadline = time.monotonic() + 5
-        for thread in list(self._threads.values()):
-            thread.join(max(0, deadline - time.monotonic()))
+        self._scheduler.shutdown(cancel_pending=True)

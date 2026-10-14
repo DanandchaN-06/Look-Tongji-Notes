@@ -2,6 +2,8 @@
 
 控制台 v0.4.4，为现有课程 CLI 提供本地图形界面。无需前端构建，不绑定特定 Agent。支持 Windows；其他系统的启动与界面代码使用标准 Python/浏览器接口，仍需对应平台验证。
 
+本仓库同时包含控制台 V2 的源码和预构建页面。源码安装可用 `python console/start.py --v2` 打开 V2；不带参数继续打开原控制台。V2 本地重构快照、源码包范围及其验证边界见[本地交付说明](../docs/CONSOLE_V2_LOCAL_DELIVERY.md)。该源码 ZIP 不包含便携 Python 或浏览器运行时。
+
 ## 安装与启动
 
 要求 Python 3.11+。在项目根目录执行：
@@ -17,6 +19,8 @@ python -m venv .venv
 
 Windows 可双击 `console/start.cmd`，或运行 `console/start.ps1`。启动器优先使用项目 `.venv`；需要复用其他环境时设置 `LOOK_TONGJI_PYTHON`，或在忽略的 `console/python.local` 中填写解释器完整路径。该本地配置不应分享。
 
+本地源码升级使用显式程序文件清单；升级器会先校验备份，再原子替换文件，失败时恢复旧程序。`.env`、`state/`、Python 运行时、浏览器和课程目录不能列入升级清单。已有 SQLite 数据库在首次结构升级前使用 SQLite 在线备份并校验；不要在服务运行时直接复制数据库文件。
+
 若 Windows 默认禁止 `.ps1`，直接使用 CMD 入口；也可仅对这次启动运行 `powershell -NoProfile -ExecutionPolicy Bypass -File console/start.ps1`，无需更改全局执行策略。
 
 还需要 ffmpeg 才能抽取音频；读取图片的桥接工具需要 Node.js 18+。制作 LaTeX 速查表需要 XeLaTeX；发布网站需要 gh CLI。缺少 tkinter 时仍可手动填写目录和材料路径。
@@ -25,6 +29,7 @@ Windows 可双击 `console/start.cmd`，或运行 `console/start.ps1`。启动�
 
 ```bash
 python console/start.py --no-window --print-url
+python console/start.py --v2
 python console/start.py --port 8766
 ```
 
@@ -48,6 +53,7 @@ python console/start.py --port 8766
 
 - 账号和密钥保存于本机 `.env` 和 `vision-support/config.json`，API 不回传密码或密钥。
 - 字幕转写使用哔哩哔哩 BcutASR，音频会上传至云端。启动转写前界面会明确提示。
+- 本地 Whisper 目前显示为不可用；安装过程不会下载模型。只有本地识别适配器完成验证后才会开放选择。更换云端识别平台会改变音频上传目标，需先确认。
 - 视觉模型会接收所选图片；点击测试前请确认图片可以发送给该平台。
 - 发布准备检查会重新检测站点、认证和明显私密文件，不代表完整安全审计。确认课程材料可以公开，且 `.env`、认证状态、API 密钥和私人材料不在站点中。
 

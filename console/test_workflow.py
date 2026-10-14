@@ -14,6 +14,34 @@ from console.server import make_server
 
 
 class OfflineWorkflow(unittest.TestCase):
+    def test_selected_course_id_survives_detail_without_id(self):
+        from scripts import look_tongji as cli
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        client = Mock()
+        client.get_course_detail.return_value = {'title':'示例课程','lectures':[{'sub_id':'202'}]}
+        with patch.object(cli,'ensure_workspace_config',return_value=object()), patch.object(cli,'prepare_lecture_workspace') as prepare:
+            cli._prepare_workspace_for_lecture(client, SimpleNamespace(),course_id='101',sub_id='202')
+        self.assertEqual(prepare.call_args.kwargs['course_detail']['course_id'], '101')
+
+    def test_course_without_id_uses_stable_digest(self):
+        from tongji_backend.workspace import _course_slug
+        import hashlib
+        self.assertEqual(_course_slug('', '示例课程'), 'course-' + hashlib.sha256('示例课程'.encode()).hexdigest()[:12])
+        self.assertEqual(_course_slug('101', '示例课程'), '101')
+
+    def test_lecture_index_uses_class_date_instead_of_processing_date(self):
+        from tongji_backend.workspace import _render_llmwiki_source
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = Path(folder)/'raw/示例课程/旧目录/原始数据/manifest.json'
+            manifest.parent.mkdir(parents=True)
+            course, session, text = _render_llmwiki_source(manifest, {
+                'course_id':'101','sub_id':'202','course_title':'示例课程',
+                'session_title':'2026-09-14第9-11节','generated_at':'2026-10-12T10:00:00','base_name':'101_202'
+            },site_name='示例知识库')
+        self.assertEqual(course,'101')
+        self.assertEqual(session,'2026-09-14-202')
+
     def test_empty_workspace_renders_original_reading_site(self):
         from tongji_backend.workspace import build_workspace_wiki
         with tempfile.TemporaryDirectory() as folder:

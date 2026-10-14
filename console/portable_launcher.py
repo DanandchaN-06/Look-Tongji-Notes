@@ -53,6 +53,11 @@ def healthy(record, site):
         return False
 
 
+def service_url(record, manager=False):
+    base = f"http://127.0.0.1:{record['port']}"
+    return f"{base}/v2/?token={record['token']}" if manager else f"{base}/"
+
+
 def serve(site, token, manager=False):
     if manager:
         sys.path.insert(0, str(APP / 'project'))
@@ -221,9 +226,7 @@ def main():
             return
         record, reused = launch(APP / 'project' if args.manager else site_directory(), args.manager)
         (STATE / 'last-error.txt').unlink(missing_ok=True)
-        url = f"http://127.0.0.1:{record['port']}/"
-        if args.manager:
-            url += '?token=' + record['token']
+        url = service_url(record, args.manager)
         if args.no_open:
             print(json.dumps({'url': url, 'pid': record['pid'], 'reused': reused}))
         elif not webbrowser.open(url):

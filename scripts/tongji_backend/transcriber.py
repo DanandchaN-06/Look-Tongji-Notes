@@ -19,6 +19,7 @@ import requests
 from . import config
 from .progress import emit as emit_progress
 from .media_tools import MediaToolError, resolve_ffmpeg
+from console.asr_providers import ASRCancelled, resolve_provider
 
 # BcutASR API endpoints
 API_BASE_URL = "https://member.bilibili.com/x/bcut/rubick-interface"
@@ -57,7 +58,7 @@ class BcutASRClient:
         self.session = requests.Session()
         self.session.headers.update(BCUT_HEADERS)
 
-    def transcribe_file(self, audio_path: str) -> tuple[str, str, list[dict]]:
+    def transcribe_file(self, audio_path: str, *, progress=None, cancel=None) -> tuple[str, str, list[dict]]:
         """Transcribe a local audio file using BcutASR.
 
         Returns:
@@ -66,6 +67,15 @@ class BcutASRClient:
             - srt_content: SRT-formatted subtitles
             - utterances: raw utterance data with timestamps
         """
+        progress = progress or (lambda _event: None)
+        cancel = cancel or (lambda: False)
+
+        def check_cancel() -> None:
+            if cancel():
+                raise ASRCancelled("识别已取消")
+
+        check_cancel()
+        progress({"stage": "uploading"})
         with open(audio_path, "rb") as f:
             file_binary = f.read()
 
@@ -82,6 +92,7 @@ class BcutASRClient:
         })
         resp = self.session.post(API_REQ_UPLOAD, data=payload)
         resp.raise_for_status()
+        check_cancel()
         resp_data = resp.json()["data"]
 
         in_boss_key = resp_data["in_boss_key"]
@@ -94,6 +105,7 @@ class BcutASRClient:
         # Step 2: Upload audio in parts
         etags = []
         for clip_idx in range(clips):
+            check_cancel()
             start = clip_idx * per_size
             end = (clip_idx + 1) * per_size
             part_resp = requests.put(
@@ -102,6 +114,7 @@ class BcutASRClient:
                 headers=BCUT_HEADERS,
             )
             part_resp.raise_for_status()
+            check_cancel()
             etag = part_resp.headers.get("Etag")
             if etag:
                 etags.append(etag)
@@ -116,6 +129,7 @@ class BcutASRClient:
         })
         resp = self.session.post(API_COMMIT_UPLOAD, data=commit_data)
         resp.raise_for_status()
+        check_cancel()
         download_url = resp.json()["data"]["download_url"]
 
         # Step 4: Create ASR task
@@ -124,16 +138,20 @@ class BcutASRClient:
             json={"resource": download_url, "model_id": "8"},
         )
         resp.raise_for_status()
+        check_cancel()
         task_id = resp.json()["data"]["task_id"]
 
         # Step 5: Poll for result
         for _ in range(600):
+            check_cancel()
             resp = self.session.get(
                 API_QUERY_RESULT,
                 params={"model_id": 7, "task_id": task_id},
             )
             resp.raise_for_status()
+            check_cancel()
             task_resp = resp.json()["data"]
+            progress({"stage": "recognizing", "provider_task_state": task_resp.get("state")})
 
             if task_resp["state"] == 4:
                 result = json.loads(task_resp["result"])
@@ -424,7 +442,8 @@ class Transcriber:
         print(f"[Transcriber] Audio extracted: {size_mb:.1f}MB in {elapsed:.0f}s")
 
     def transcribe_url(self, url: str, timeout: int = 7200,
-                       http_headers: str = None, audio_cache_path: str | Path | None = None) -> tuple[str, str, list[dict]]:
+                       http_headers: str = None, audio_cache_path: str | Path | None = None,
+                       cancel=None) -> tuple[str, str, list[dict]]:
         """Stream audio from URL, transcribe with BcutASR.
 
         Returns:
@@ -432,6 +451,7 @@ class Transcriber:
         """
         max_retries = config.MAX_ASR_RETRIES
         backoff_base = config.ASR_RETRY_BACKOFF
+        cancel = cancel or (lambda: False)
         asr = self._get_asr()
         tmp_path = None
         if audio_cache_path and Path(audio_cache_path).is_file() and Path(audio_cache_path).stat().st_size > 0:
@@ -440,7 +460,9 @@ class Transcriber:
             emit_progress("transcript", "reuse_audio")
         last_error = None
         completed = False
+        rejected = False
         for attempt in range(1, max_retries + 1):
+            recognizing = False
             try:
                 print(f"[Transcriber] Attempt {attempt}/{max_retries}")
                 if not tmp_path or not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
@@ -451,7 +473,13 @@ class Transcriber:
 
                 t0 = time.time()
                 emit_progress("transcript", "recognize")
-                plain_text, srt_content, utterances = asr.transcribe_file(tmp_path)
+                recognizing = True
+                provider = resolve_provider("bcutasr", bcut_client=asr)
+                plain_text, srt_content, utterances = provider.transcribe(
+                    tmp_path,
+                    progress=lambda event: emit_progress("transcript", event.get("stage", "recognize")),
+                    cancel=cancel,
+                )
                 elapsed = time.time() - t0
 
                 if not plain_text or not plain_text.strip():
@@ -462,11 +490,19 @@ class Transcriber:
                 print(f"[Transcriber] Success: {len(plain_text)} chars in {elapsed:.0f}s")
                 return plain_text, srt_content, utterances
 
-            except (NoAudioStreamError, MediaToolError):
+            except (NoAudioStreamError, MediaToolError, ASRCancelled):
                 raise
 
             except Exception as e:
                 last_error = e
+                response = getattr(e, 'response', None)
+                status = getattr(response, 'status_code', None)
+                if recognizing and isinstance(e, requests.HTTPError) and status in (401, 403, 412):
+                    rejected = True
+                    raise TranscriptionError(
+                        f"云端字幕识别服务拒绝请求（HTTP {status}）。本次停止自动重试；"
+                        "已有缓存音频会保留。请稍后在任务中心重试，恢复后可继续识别，无需重新下载视频。"
+                    ) from e
                 print(f"[Transcriber] Attempt {attempt}/{max_retries} failed: {e}")
                 if attempt < max_retries:
                     wait = backoff_base * (2 ** (attempt - 1))
@@ -475,7 +511,7 @@ class Transcriber:
                     time.sleep(wait)
 
             finally:
-                if not audio_cache_path and tmp_path and os.path.exists(tmp_path) and (attempt == max_retries or completed or last_error is None):
+                if not audio_cache_path and tmp_path and os.path.exists(tmp_path) and (attempt == max_retries or completed or rejected or last_error is None):
                     try:
                         os.remove(tmp_path)
                         tmp_dir = os.path.dirname(tmp_path)

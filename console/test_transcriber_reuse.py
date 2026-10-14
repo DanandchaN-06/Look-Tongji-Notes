@@ -14,6 +14,24 @@ from tongji_backend.transcriber import Transcriber, TranscriptionError
 
 
 class ReuseTests(unittest.TestCase):
+    def test_asr_rejection_stops_without_backoff_and_keeps_audio(self):
+        import requests
+        with tempfile.TemporaryDirectory() as folder:
+            audio = Path(folder) / 'audio.mp3'
+            audio.write_bytes(b'synthetic audio')
+            worker = Transcriber()
+            worker._asr = Mock()
+            response = requests.Response()
+            response.status_code = 412
+            worker._asr.transcribe_file.side_effect = requests.HTTPError(response=response)
+            with patch.object(worker, '_download_audio') as download, patch('tongji_backend.transcriber.time.sleep') as sleep:
+                with self.assertRaisesRegex(TranscriptionError, '412'):
+                    worker.transcribe_url('https://example.test/video', audio_cache_path=audio)
+            self.assertEqual(worker._asr.transcribe_file.call_count, 1)
+            sleep.assert_not_called()
+            download.assert_not_called()
+            self.assertTrue(audio.exists())
+
     def test_asr_retry_downloads_once_and_reuses_audio(self):
         with tempfile.TemporaryDirectory() as folder:
             audio=Path(folder)/'audio.mp3'
@@ -68,7 +86,7 @@ class ReuseTests(unittest.TestCase):
                     Transcriber()._parallel_download('https://example.test/video',tmp_dir=folder)
             self.assertFalse((Path(folder)/'video_raw.tmp').exists())
 
-    def test_saved_transcript_skips_video_lookup_and_transcription(self):
+    def test_no_media_call_when_transcript_ready(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)
             (root/'101_202.txt').write_text('already transcribed',encoding='utf-8')
